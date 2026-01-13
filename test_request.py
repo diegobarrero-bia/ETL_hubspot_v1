@@ -8,6 +8,7 @@ import logging
 import json
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
+import warnings 
 
 # --- IMPORTS DE DB Y SQLALCHEMY ---
 from sqlalchemy import create_engine, inspect, text
@@ -25,11 +26,17 @@ DB_USER = os.getenv("DB_USER")
 DB_PASS = os.getenv("DB_PASS")
 
 OBJECT_TYPE = "services"
-TABLE_NAME = "services"
+# --- CAMBIOS SOLICITADOS ---
+DB_SCHEMA = "public"      
+TABLE_NAME = "services"   
+# ---------------------------
 
 OUTPUT_FOLDER = "exports"
 LOG_FILE = "etl_errors.log"
-REPORT_FILE = os.path.join(OUTPUT_FOLDER, "etl_health_report.txt")
+
+# Nombre dinámico del reporte con fecha y hora
+report_timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+REPORT_FILE = os.path.join(OUTPUT_FOLDER, f"etl_health_report_{report_timestamp}.txt")
 
 logging.basicConfig(
     filename=LOG_FILE,
@@ -47,7 +54,7 @@ def ensure_exports_folder():
     if not os.path.exists(OUTPUT_FOLDER):
         os.makedirs(OUTPUT_FOLDER)
 
-# --- CLASE MONITOR (ACTUALIZADA) ---
+# --- CLASE MONITOR ---
 class ETLMonitor:
     def __init__(self):
         self.start_time = time.time()
@@ -58,11 +65,9 @@ class ETLMonitor:
             'columns_truncated': 0, 'associations_found': 0,
             'associations_missing': 0, 'db_upserts': 0,
             'schema_changes': 0,
-            # NUEVAS MÉTRICAS DB
             'db_execution_time': 0.0,
             'db_insert_errors': 0
         }
-        # Diccionario para guardar estadísticas de nulos por columna
         self.null_stats = {}
 
     def increment(self, metric, count=1):
@@ -70,22 +75,16 @@ class ETLMonitor:
             self.metrics[metric] += count
     
     def set_metric(self, metric, value):
-        """Asigna un valor directo a una métrica (ej. tiempos)"""
         if metric in self.metrics:
             self.metrics[metric] = value
 
     def record_null_stats(self, df):
-        """Calcula y guarda el % de nulos de cada columna"""
         total_rows = len(df)
         if total_rows == 0: return
-
-        # Calculamos nulos por columna
         null_counts = df.isnull().sum()
-        
         for col, count in null_counts.items():
             if count > 0:
                 pct = (count / total_rows) * 100
-                # Guardamos tupla (cantidad, porcentaje)
                 self.null_stats[col] = (count, pct)
 
     def generate_report(self):
@@ -93,14 +92,11 @@ class ETLMonitor:
         duration_str = str(timedelta(seconds=int(duration)))
         m = self.metrics
         
-        # Formateamos la sección de Nulos (Top 10 columnas críticas)
         nulls_report = ""
         if self.null_stats:
-            # Ordenamos por porcentaje descendente
             sorted_nulls = sorted(self.null_stats.items(), key=lambda x: x[1][1], reverse=True)[:10]
             nulls_report = "\n   [Top Columnas con Valores Vacíos]\n"
             for col, (count, pct) in sorted_nulls:
-                # Alerta visual si pasa del 10%
                 alert = "⚠️" if pct > 10 else " "
                 nulls_report += f"   - {col[:30]:<30} : {count:>4} vacíos ({pct:>5.1f}%) {alert}\n"
         else:
@@ -112,6 +108,8 @@ class ETLMonitor:
 ==================================================
 Fecha de Ejecución: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 Duración Total    : {duration_str}
+Schema Destino    : {DB_SCHEMA}
+Tabla Destino     : {TABLE_NAME}
 Estado General    : {'🟢 SALUDABLE' if m['records_failed'] == 0 and m['db_insert_errors'] == 0 else '⚠️ CON ERRORES'}
 
 1. CONEXIÓN API & VOLUMEN
@@ -161,12 +159,14 @@ def upsert_on_conflict(table, conn, keys, data_iter):
     )
     conn.execute(on_conflict_stmt)
 
-def sync_db_schema(engine, df, table_name):
+def sync_db_schema(engine, df, table_name, schema):
     print("Verificando consistencia del esquema...")
     inspector = inspect(engine)
-    if not inspector.has_table(table_name): return
+    
+    if not inspector.has_table(table_name, schema=schema): 
+        return
 
-    existing_cols = [c['name'] for c in inspector.get_columns(table_name)]
+    existing_cols = [c['name'] for c in inspector.get_columns(table_name, schema=schema)]
     new_cols = set(df.columns) - set(existing_cols)
     
     if new_cols:
@@ -180,18 +180,104 @@ def sync_db_schema(engine, df, table_name):
                 elif pd.api.types.is_bool_dtype(dtype): pg_type = "BOOLEAN"
                 elif pd.api.types.is_datetime64_any_dtype(dtype): pg_type = "TIMESTAMP"
                 
-                conn.execute(text(f'ALTER TABLE "{table_name}" ADD COLUMN "{col}" {pg_type}'))
+                conn.execute(text(f'ALTER TABLE "{schema}"."{table_name}" ADD COLUMN "{col}" {pg_type}'))
                 monitor.increment('schema_changes')
                 logging.warning(f"Schema Evolution: Agregada columna '{col}' ({pg_type})")
 
+def initialize_db_schema(engine):
+    """
+    Crea el Schema (si no existe) y la Tabla inicial.
+    """
+    print(f"Verificando Schema '{DB_SCHEMA}' y Tabla '{TABLE_NAME}'...")
+    
+    create_schema_sql = text(f"CREATE SCHEMA IF NOT EXISTS {DB_SCHEMA}")
+
+    ddl_query = text(f"""
+    CREATE TABLE IF NOT EXISTS {DB_SCHEMA}.{TABLE_NAME} (
+        "hs_object_id" BIGINT PRIMARY KEY,
+        "company_id" BIGINT,
+        "hs_created_by_user_id" BIGINT,
+        "hs_updated_by_user_id" BIGINT,
+        "hubspot_owner_id" BIGINT,
+        "hubspot_team_id" BIGINT,
+        
+        "bia_profit" NUMERIC,
+        "hs_amount_paid" NUMERIC,
+        "hs_amount_remaining" NUMERIC,
+        "hs_total_cost" NUMERIC,
+        "investment_value" NUMERIC,
+        "offer_value" NUMERIC,
+        "revenue" NUMERIC,
+        
+        "hs_createdate" TIMESTAMP,
+        "hs_lastmodifieddate" TIMESTAMP,
+        "hs_close_date" TIMESTAMP,
+        "hs_next_activity_date" TIMESTAMP,
+        "hubspot_owner_assigneddate" TIMESTAMP,
+        "_fivetran_synced" TIMESTAMP, 
+        
+        "hs_v2_cumulative_time_in_envio_de_oferta" BIGINT,
+        "hs_v2_cumulative_time_in_decision_del_cliente" BIGINT,
+        "hs_v2_cumulative_time_in_completado" BIGINT,
+        "hs_v2_cumulative_time_in_visita_previa" BIGINT,
+        "hs_v2_cumulative_time_in_oportunidad" BIGINT,
+        
+        "hs_v2_date_entered_envio_de_oferta" TIMESTAMP,
+        "hs_v2_date_entered_decision_del_cliente" TIMESTAMP,
+        "hs_v2_date_entered_completado" TIMESTAMP,
+        "hs_v2_date_entered_visita_previa" TIMESTAMP,
+        "hs_v2_date_entered_oportunidad" TIMESTAMP,
+        
+        "hs_was_imported" BOOLEAN,
+        "_fivetran_deleted" BOOLEAN,
+        "is_deleted" BOOLEAN,
+
+        "hs_name" TEXT,
+        "hs_pipeline" TEXT,
+        "hs_pipeline_stage" TEXT,
+        "bia_code" TEXT,
+        "business_model" TEXT,
+        "hs_category" TEXT,
+        "hs_description" TEXT,
+        "hs_object_source" TEXT,
+        "hs_object_source_label" TEXT,
+        "offer_url" TEXT,
+        "operations_status" TEXT,
+        "reason_for_objection" TEXT,
+        "requesting_area" TEXT,
+        
+        "asoc_contacts_ids" TEXT,
+        "asoc_companies_ids" TEXT,
+        
+        "hs_all_accessible_team_ids" TEXT,
+        "hs_all_owner_ids" TEXT,
+        "hs_merged_object_ids" TEXT,
+        "hs_unique_creation_key" TEXT,
+        "hs_user_ids_of_all_owners" TEXT
+    );
+    """)
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(create_schema_sql) 
+            conn.execute(ddl_query)         
+        print("✅ Esquema y Tabla verificados correctamente.")
+    except Exception as e:
+        print(f"❌ Error inicializando BD: {e}")
+        raise e
+
 def clean_dates(df):
     date_keywords = ['date', 'time', 'synced', 'timestamp']
+    import warnings
     for col in df.columns:
         if any(k in col.lower() for k in date_keywords) or df[col].dtype == 'object':
             if any(k in col.lower() for k in date_keywords):
                 try:
-                    df[col] = pd.to_datetime(df[col], errors='coerce')
-                except Exception: pass
+                    df[col] = pd.to_datetime(df[col], errors='raise', format='ISO8601')
+                except (ValueError, TypeError, Exception):
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        df[col] = pd.to_datetime(df[col], errors='coerce')
     return df
 
 # --- FUNCIONES AUXILIARES ETL ---
@@ -263,97 +349,6 @@ def get_assocs():
     res = safe_request('GET', url)
     return [a['toObjectTypeId'] for a in res.json().get('associations', [])]
 
-def initialize_db_schema(engine):
-    """
-    Ejecuta el DDL inicial usando el nombre de tabla global.
-    """
-    # Usamos la variable global TABLE_NAME para asegurar que coincida con la carga
-    print(f"Verificando/Creando tabla '{TABLE_NAME}'...")
-    
-    ddl_query = text(f"""
-    CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
-        -- Clave Primaria (VITAL PARA UPSERT)
-        "hs_object_id" BIGINT PRIMARY KEY,
-        
-        -- IDs y Relaciones
-        "company_id" BIGINT,
-        "hs_created_by_user_id" BIGINT,
-        "hs_updated_by_user_id" BIGINT,
-        "hubspot_owner_id" BIGINT,
-        "hubspot_team_id" BIGINT,
-        
-        -- Métricas Numéricas
-        "bia_profit" NUMERIC,
-        "hs_amount_paid" NUMERIC,
-        "hs_amount_remaining" NUMERIC,
-        "hs_total_cost" NUMERIC,
-        "investment_value" NUMERIC,
-        "offer_value" NUMERIC,
-        "revenue" NUMERIC,
-        
-        -- Fechas y Tiempos
-        "hs_createdate" TIMESTAMP,
-        "hs_lastmodifieddate" TIMESTAMP,
-        "hs_close_date" TIMESTAMP,
-        "hs_next_activity_date" TIMESTAMP,
-        "hubspot_owner_assigneddate" TIMESTAMP,
-        "_fivetran_synced" TIMESTAMP, 
-        
-        -- Tiempos en Etapas
-        "hs_v2_cumulative_time_in_envio_de_oferta" BIGINT,
-        "hs_v2_cumulative_time_in_decision_del_cliente" BIGINT,
-        "hs_v2_cumulative_time_in_completado" BIGINT,
-        "hs_v2_cumulative_time_in_visita_previa" BIGINT,
-        "hs_v2_cumulative_time_in_oportunidad" BIGINT,
-        
-        -- Fechas de Entrada a Etapas
-        "hs_v2_date_entered_envio_de_oferta" TIMESTAMP,
-        "hs_v2_date_entered_decision_del_cliente" TIMESTAMP,
-        "hs_v2_date_entered_completado" TIMESTAMP,
-        "hs_v2_date_entered_visita_previa" TIMESTAMP,
-        "hs_v2_date_entered_oportunidad" TIMESTAMP,
-        
-        -- Flags Booleanos
-        "hs_was_imported" BOOLEAN,
-        "_fivetran_deleted" BOOLEAN,
-        "is_deleted" BOOLEAN,
-
-        -- Campos de Texto
-        "hs_name" TEXT,
-        "hs_pipeline" TEXT,
-        "hs_pipeline_stage" TEXT,
-        "bia_code" TEXT,
-        "business_model" TEXT,
-        "hs_category" TEXT,
-        "hs_description" TEXT,
-        "hs_object_source" TEXT,
-        "hs_object_source_label" TEXT,
-        "offer_url" TEXT,
-        "operations_status" TEXT,
-        "reason_for_objection" TEXT,
-        "requesting_area" TEXT,
-        
-        -- Asociaciones
-        "asoc_contacts_ids" TEXT,
-        "asoc_companies_ids" TEXT,
-        
-        -- Otros campos
-        "hs_all_accessible_team_ids" TEXT,
-        "hs_all_owner_ids" TEXT,
-        "hs_merged_object_ids" TEXT,
-        "hs_unique_creation_key" TEXT,
-        "hs_user_ids_of_all_owners" TEXT
-    );
-    """)
-
-    try:
-        with engine.begin() as conn:
-            conn.execute(ddl_query)
-        print("✅ Esquema inicial verificado correctamente.")
-    except Exception as e:
-        print(f"❌ Error creando tabla inicial: {e}")
-        raise e
-
 # --- PROCESO PRINCIPAL ---
 def run_postgres_etl():
     try:
@@ -361,11 +356,10 @@ def run_postgres_etl():
         engine = get_db_engine()
         print("✅ Motor de BD iniciado.")
 
-        # --- PASO 1: PRIMER ARRANQUE (NUEVO) ---
-        # Ejecutamos esto ANTES de descargar nada para asegurar que la BD está lista
+        # 1. Preparar BD 
         initialize_db_schema(engine) 
 
-        # Metadatos y Descarga (Igual que antes)
+        # 2. Descarga de HubSpot
         print("Obteniendo propiedades...")
         props_res = safe_request('GET', f"https://api.hubapi.com/crm/v3/properties/{OBJECT_TYPE}")
         all_props = [p['name'] for p in props_res.json()['results']]
@@ -398,7 +392,7 @@ def run_postgres_etl():
             if paging and 'next' in paging: after = paging['next']['after']
             else: break
 
-        # Procesamiento
+        # 3. Procesamiento en Memoria
         print(f"Procesando {len(all_records)} registros...")
         data_list = []
         synced_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -432,7 +426,7 @@ def run_postgres_etl():
 
         if not data_list: return
 
-        # Transformación
+        # 4. Transformación DataFrame
         df = pd.DataFrame(data_list)
         df.rename(columns=col_map, inplace=True)
         df.columns = [normalize_name(c) for c in df.columns]
@@ -441,40 +435,37 @@ def run_postgres_etl():
         for col in df.columns:
             df[col] = df[col].apply(lambda x: json.dumps(x) if isinstance(x, (dict, list)) else x)
 
-        # --- NUEVO: ANÁLISIS DE CALIDAD (NULOS) ---
         print("Analizando calidad de datos (Valores Nulos)...")
         monitor.record_null_stats(df)
 
-        sync_db_schema(engine, df, TABLE_NAME)
+        # 5. Sincronización de Schema 
+        sync_db_schema(engine, df, TABLE_NAME, DB_SCHEMA)
 
-        # --- NUEVO: CARGA MONITOREADA ---
-        print("Subiendo a PostgreSQL (Upsert)...")
+        # 6. Carga a BD 
+        print(f"Subiendo a PostgreSQL ({DB_SCHEMA}.{TABLE_NAME})...")
         
-        db_start_time = time.time() # Cronómetro DB Start
+        db_start_time = time.time()
         
         try:
             with engine.begin() as conn:
                 df.to_sql(
                     TABLE_NAME, 
                     con=conn, 
+                    schema=DB_SCHEMA,  
                     if_exists='append', 
                     index=False, 
                     method=upsert_on_conflict, 
                     chunksize=500 
                 )
             
-            # Si llega aquí, todo salió bien
             monitor.metrics['db_upserts'] = len(df)
         
         except Exception as e:
-            # Si falla, registramos que TODOS los registros del lote fueron rechazados
             monitor.metrics['db_insert_errors'] = len(df)
             logging.critical(f"Fallo masivo en carga DB: {e}")
             print(f"❌ Error crítico en base de datos: {e}")
-            # No detenemos el script con raise aquí para permitir que se genere el reporte final
         
         finally:
-            # Cronómetro DB Stop
             db_duration = time.time() - db_start_time
             monitor.set_metric('db_execution_time', db_duration)
 
