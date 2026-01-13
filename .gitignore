@@ -5,3 +5,4 @@
 *.xlsx
 __pycache__/
 *.log
+/exports/
