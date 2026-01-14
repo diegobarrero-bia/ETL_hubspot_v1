@@ -26,10 +26,8 @@ DB_USER = os.getenv("DB_USER")
 DB_PASS = os.getenv("DB_PASS")
 
 OBJECT_TYPE = "services"
-# --- CAMBIOS SOLICITADOS ---
-DB_SCHEMA = "public"      
+DB_SCHEMA = "hubspot_etl"      
 TABLE_NAME = "services"   
-# ---------------------------
 
 OUTPUT_FOLDER = "exports"
 LOG_FILE = "etl_errors.log"
