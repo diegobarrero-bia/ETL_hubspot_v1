@@ -203,8 +203,8 @@ def initialize_db_schema(engine):
     CREATE TABLE IF NOT EXISTS {DB_SCHEMA}.{TABLE_NAME} (
         "hs_object_id" BIGINT PRIMARY KEY,
         "hs_lastmodifieddate" TIMESTAMP,
-        "_fivetran_synced" TIMESTAMP,
-        "_fivetran_deleted" BOOLEAN
+        "fivetran_synced" TIMESTAMP,
+        "fivetran_deleted" BOOLEAN
     );
     """)
 
@@ -361,8 +361,8 @@ def process_batch(batch_records, col_map):
             
             # Metadata
             archived = record.get("archived", False)
-            row["_fivetran_synced"] = synced_at
-            row["_fivetran_deleted"] = archived
+            row["fivetran_synced"] = synced_at
+            row["fivetran_deleted"] = archived
             
             # Procesar Asociaciones (Flatten to String)
             raw_assoc = record.get("associations")
