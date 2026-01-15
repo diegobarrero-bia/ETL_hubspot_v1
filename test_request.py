@@ -8,7 +8,7 @@ import logging
 import json
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
-import warnings 
+import warnings
 
 # --- IMPORTS DE DB Y SQLALCHEMY ---
 from sqlalchemy import create_engine, inspect, text
@@ -217,15 +217,26 @@ def initialize_db_schema(engine):
         raise e
 
 def clean_dates(df):
-    date_keywords = ['date', 'time', 'synced', 'timestamp']
+    # Keywords que indican fechas REALES (no duración)
+    date_keywords = ['date', 'synced', 'timestamp', 'createdate', 'modifieddate']
+    
+    # Excepciones: columnas que contienen "time" pero NO son fechas (son duraciones en ms)
+    duration_keywords = ['cumulative_time', 'latest_time_in', 'time_in_stage', 'duration']
+    
     for col in df.columns:
-        # Detectar columnas de fecha por nombre o tipo
-        if any(k in col.lower() for k in date_keywords) or df[col].dtype == 'object':
-            if any(k in col.lower() for k in date_keywords):
-                try:
-                    df[col] = pd.to_datetime(df[col], errors='coerce')
-                except Exception:
-                    pass
+        col_lower = col.lower()
+        
+        # Si es una columna de duración, NO la toques
+        if any(k in col_lower for k in duration_keywords):
+            continue
+        
+        # Si contiene keywords de fecha, intenta convertir
+        if any(k in col_lower for k in date_keywords):
+            try:
+                df[col] = pd.to_datetime(df[col], errors='coerce')
+            except Exception:
+                pass
+    
     return df
 
 # --- FUNCIONES AUXILIARES ETL ---
@@ -287,11 +298,14 @@ def get_smart_mapping(all_props):
     
     for pipe in pipelines:
         for stage in pipe.get('stages', []):
-            s_id = stage['id'].replace("-", "_")
+            s_id = stage['id']  # ← Mantener el ID original con guiones
+            s_id_normalized = s_id.replace("-", "_")  # ← Version con underscores
             s_lbl = stage['label']
+            
             for prop in all_props:
                 for pre in prefixes:
-                    if prop.startswith(pre) and s_id in prop:
+                    # Buscar tanto con guiones como con underscores
+                    if prop.startswith(pre) and (s_id in prop or s_id_normalized in prop):
                         # Mapeamos IDs técnicos a Labels legibles
                         mapping[prop] = normalize_name(f"{pre}_{s_lbl}")
     return mapping
@@ -468,8 +482,55 @@ def run_postgres_etl():
                 
             except Exception as e:
                 monitor.metrics['db_insert_errors'] += len(df_batch)
-                logging.error(f"Fallo carga lote {batch_count}: {e}")
-                print(f"❌ Error cargando lote {batch_count}: {e}")
+                
+                # Identificar tipo específico de error
+                error_type = type(e).__name__
+                error_msg = str(e)
+                
+                # 1. Errores de Tipo de Dato (DatetimeFieldOverflow, DataError, etc.)
+                if 'DatetimeFieldOverflow' in error_type or 'date/time field value out of range' in error_msg:
+                    # Extraer el valor problemático del mensaje de error
+                    value_match = re.search(r'"(\d+)"', error_msg)
+                    problematic_value = value_match.group(1) if value_match else "desconocido"
+                    
+                    user_friendly_msg = (
+                        f"⚠️ ERROR DE TIPO DE DATO - Lote {batch_count}\n"
+                        f"   Problema: Intentando insertar valor '{problematic_value}' en columna con tipo incompatible"
+                    )
+                    
+                    print(user_friendly_msg)
+                    logging.error(user_friendly_msg)
+                    logging.error(f"   Detalle técnico completo: {e}")
+                
+                # 2. Errores de Integridad (Duplicados, FKs, etc.)
+                elif 'IntegrityError' in error_type or 'duplicate key' in error_msg.lower():
+                    user_friendly_msg = (
+                        f"⚠️ ERROR DE INTEGRIDAD - Lote {batch_count}\n"
+                        f"   Problema: Violación de constraint de base de datos"
+                    )
+                    print(user_friendly_msg)
+                    logging.error(user_friendly_msg)
+                    logging.error(f"   Detalle técnico completo: {e}")
+                
+                # 3. Errores de Columna (nombre inválido, no existe, etc.)
+                elif 'ProgrammingError' in error_type or 'column' in error_msg.lower():
+                    user_friendly_msg = (
+                        f"⚠️ ERROR DE ESQUEMA - Lote {batch_count}\n"
+                        f"   Problema: Error en definición de columna o tabla"
+                    )
+                    print(user_friendly_msg)
+                    logging.error(user_friendly_msg)
+                    logging.error(f"   Detalle técnico completo: {e}")
+                
+                # 4. Error Genérico (mantener para otros casos)
+                else:
+                    user_friendly_msg = (
+                        f"❌ ERROR DESCONOCIDO - Lote {batch_count}\n"
+                        f"   Tipo: {error_type}"
+                    )
+                    print(user_friendly_msg)
+                    logging.error(user_friendly_msg)
+                    logging.error(f"   Detalle técnico completo: {e}")
             
             monitor.metrics['db_execution_time'] += (time.time() - db_start_time)
             monitor.record_null_stats(df_batch) # Stats por lote
