@@ -25,9 +25,9 @@ DB_NAME = os.getenv("DB_NAME")
 DB_USER = os.getenv("DB_USER")
 DB_PASS = os.getenv("DB_PASS")
 
-OBJECT_TYPE = "services"
+OBJECT_TYPE = "companies"
 DB_SCHEMA = "hubspot_etl"      
-TABLE_NAME = "services"   
+TABLE_NAME = "companies"   
 
 OUTPUT_FOLDER = "exports"
 LOG_FILE = "etl_errors.log"
@@ -248,17 +248,49 @@ def safe_request(method, url, **kwargs):
             # Importante: para GET usamos params, para POST usamos json
             res = requests.request(method, url, headers=headers, **kwargs)
             
-            if res.status_code == 200: return res
+            if res.status_code == 200: 
+                return res
+            
+            # Manejo específico de errores con detalles
+            elif res.status_code == 400:
+                error_detail = ""
+                try:
+                    error_json = res.json()
+                    error_detail = json.dumps(error_json, indent=2)
+                except:
+                    error_detail = res.text
+                
+                # Log detallado del error
+                logging.error(f"❌ ERROR 400 Bad Request en {url}")
+                logging.error(f"   Método: {method}")
+                logging.error(f"   Parámetros enviados: {kwargs}")
+                logging.error(f"   Respuesta de HubSpot:\n{error_detail}")
+                
+                raise Exception(
+                    f"Bad Request (400) en {url}\n"
+                    f"Detalles: {error_detail[:500]}..."
+                )
+            
             elif res.status_code == 414:
                 raise Exception("URL Too Long (414). Demasiadas propiedades solicitadas en GET.")
+            
             elif res.status_code == 429:
-                monitor.increment('retries_429'); time.sleep(10)
+                monitor.increment('retries_429')
+                time.sleep(10)
+            
             elif 500 <= res.status_code < 600:
-                monitor.increment('retries_5xx'); time.sleep(backoff * attempt)
-            else: res.raise_for_status()
+                monitor.increment('retries_5xx')
+                time.sleep(backoff * attempt)
+            
+            else: 
+                res.raise_for_status()
+                
         except requests.exceptions.ConnectionError:
-            monitor.increment('connection_errors'); time.sleep(backoff * attempt)
-        except Exception as e: raise e
+            monitor.increment('connection_errors')
+            time.sleep(backoff * attempt)
+        except Exception as e: 
+            raise e
+            
     raise Exception(f"Fallo crítico en {url}")
 
 def normalize_name(text):
@@ -314,9 +346,89 @@ def get_assocs():
     # Obtiene asociaciones disponibles
     url = f"https://api.hubapi.com/crm/v3/schemas/{OBJECT_TYPE}"
     res = safe_request('GET', url)
-    return [a['toObjectTypeId'] for a in res.json().get('associations', [])]
+    all_assocs = [a['toObjectTypeId'] for a in res.json().get('associations', [])]
+    
+    # Retornar todas las asociaciones (se procesarán en chunks después)
+    if len(all_assocs) > 30:
+        logging.info(f"ℹ️ Objeto tiene {len(all_assocs)} asociaciones. Se procesarán en chunks de 30.")
+        print(f"ℹ️ Se encontraron {len(all_assocs)} asociaciones. Se procesarán en múltiples llamadas (límite API: 30)")
+    
+    return all_assocs
 
 # --- NUEVAS FUNCIONES PARA GET / LIST ---
+
+def fetch_all_records_with_chunked_assocs(properties, associations):
+    """
+    Descarga todos los registros manejando el límite de 30 asociaciones por request.
+    Si hay más de 30 asociaciones, hace múltiples llamadas y combina los resultados.
+    """
+    chunk_size = 30
+    
+    # Si hay 30 o menos asociaciones, usar el flujo normal
+    if len(associations) <= chunk_size:
+        for batch in fetch_hubspot_records_generator(properties, associations):
+            yield batch
+        return
+    
+    # Dividir asociaciones en chunks
+    assoc_chunks = [associations[i:i + chunk_size] for i in range(0, len(associations), chunk_size)]
+    
+    print(f"\n🔄 Dividiendo {len(associations)} asociaciones en {len(assoc_chunks)} llamadas API")
+    logging.info(f"Procesando asociaciones en {len(assoc_chunks)} chunks de máximo {chunk_size}")
+    
+    # Diccionario para almacenar y combinar registros por ID
+    all_records_dict = {}
+    
+    for chunk_idx, assoc_chunk in enumerate(assoc_chunks):
+        print(f"\n📡 Procesando chunk {chunk_idx + 1}/{len(assoc_chunks)} de asociaciones...")
+        print(f"   Asociaciones en este chunk: {len(assoc_chunk)}")
+        
+        # Descargar registros con este chunk de asociaciones
+        for batch in fetch_hubspot_records_generator(properties, assoc_chunk):
+            for record in batch:
+                record_id = record['id']
+                
+                # Si es la primera vez que vemos este registro
+                if record_id not in all_records_dict:
+                    all_records_dict[record_id] = record
+                else:
+                    # Combinar asociaciones de múltiples llamadas
+                    existing_record = all_records_dict[record_id]
+                    existing_assocs = existing_record.get('associations', {})
+                    new_assocs = record.get('associations', {})
+                    
+                    # Merge de asociaciones
+                    for assoc_type, assoc_data in new_assocs.items():
+                        if assoc_type not in existing_assocs:
+                            existing_assocs[assoc_type] = assoc_data
+                        else:
+                            # Combinar results evitando duplicados
+                            existing_results = existing_assocs[assoc_type].get('results', [])
+                            new_results = assoc_data.get('results', [])
+                            
+                            # Crear set de IDs existentes para evitar duplicados
+                            existing_ids = {r['id'] for r in existing_results if 'id' in r}
+                            
+                            # Agregar solo los nuevos que no existen
+                            for new_result in new_results:
+                                if 'id' in new_result and new_result['id'] not in existing_ids:
+                                    existing_results.append(new_result)
+                            
+                            existing_assocs[assoc_type]['results'] = existing_results
+                    
+                    existing_record['associations'] = existing_assocs
+        
+        print(f"   ✓ Chunk {chunk_idx + 1} completado. Total registros únicos: {len(all_records_dict)}")
+    
+    # Convertir diccionario a lista y entregar en batches de 100
+    print(f"\n✅ Todas las asociaciones procesadas. Entregando {len(all_records_dict)} registros únicos...")
+    
+    all_records_list = list(all_records_dict.values())
+    batch_size = 100
+    
+    for i in range(0, len(all_records_list), batch_size):
+        batch = all_records_list[i:i + batch_size]
+        yield batch
 
 def fetch_hubspot_records_generator(properties, associations):
     """
@@ -326,38 +438,94 @@ def fetch_hubspot_records_generator(properties, associations):
     url = f"https://api.hubapi.com/crm/v3/objects/{OBJECT_TYPE}"
     
     # Preparamos los parámetros base
-    # NOTA: Si properties_str es > 2000 chars, esto podría fallar con 414.
     properties_str = ",".join(properties)
-    associations_str = ",".join(associations)
+    associations_str = ",".join(associations) if associations else ""
+    
+    # 🔍 DEBUG: Validación detallada de parámetros
+    print(f"\n{'='*60}")
+    print(f"🔍 DEBUG - Parámetros de Request")
+    print(f"{'='*60}")
+    print(f"Object Type      : {OBJECT_TYPE}")
+    print(f"URL Base         : {url}")
+    print(f"Total Properties : {len(properties)}")
+    print(f"Properties Length: {len(properties_str)} chars")
+    print(f"Total Assocs     : {len(associations)}")
+    print(f"Assocs Length    : {len(associations_str)} chars")
+    
+    # Mostrar primeras propiedades como muestra
+    if properties:
+        print(f"\nPrimeras 5 propiedades:")
+        for prop in properties[:5]:
+            print(f"  - {prop}")
+        if len(properties) > 5:
+            print(f"  ... y {len(properties) - 5} más")
+    
+    # Mostrar asociaciones
+    if associations:
+        print(f"\nAsociaciones solicitadas:")
+        for assoc in associations:
+            print(f"  - {assoc}")
+    else:
+        print(f"\n⚠️ No se solicitaron asociaciones")
+    
+    # Validación de longitud total
+    estimated_url_length = len(url) + len(properties_str) + len(associations_str) + 100
+    print(f"\nLongitud URL estimada: {estimated_url_length} chars")
+    
+    if estimated_url_length > 8000:
+        warning_msg = (
+            f"⚠️ URL demasiado larga ({estimated_url_length} chars).\n"
+            f"   Límite recomendado: 8000 chars\n"
+            f"   Propiedades: {len(properties)} ({len(properties_str)} chars)\n"
+            f"   Considera reducir propiedades o usar POST/Search endpoint."
+        )
+        logging.warning(warning_msg)
+        print(warning_msg)
+    elif estimated_url_length > 6000:
+        warning_msg = f"⚠️ Advertencia: URL larga ({estimated_url_length} chars). Podría fallar."
+        logging.warning(warning_msg)
+        print(warning_msg)
+    else:
+        print(f"✓ Longitud URL aceptable")
+    
+    print(f"{'='*60}\n")
     
     params = {
-        "limit": 100, # Max permitido por página en GET
+        "limit": 100,
         "properties": properties_str,
         "associations": associations_str,
         "archived": "false"
     }
     
-    print(f"📡 Iniciando descarga con GET (Params length: {len(properties_str)} chars)...")
+    print(f"📡 Iniciando descarga con GET...")
     
     after = None
     while True:
         if after:
             params['after'] = after
-            
-        res = safe_request('GET', url, params=params)
-        data = res.json()
-        results = data.get('results', [])
         
-        if not results:
-            break
+        try:
+            res = safe_request('GET', url, params=params)
+            data = res.json()
+            results = data.get('results', [])
             
-        yield results # Entregamos el lote actual para procesar
-        
-        paging = data.get('paging')
-        if paging and 'next' in paging:
-            after = paging['next']['after']
-        else:
-            break
+            if not results:
+                break
+                
+            yield results
+            
+            paging = data.get('paging')
+            if paging and 'next' in paging:
+                after = paging['next']['after']
+            else:
+                break
+                
+        except Exception as e:
+            # 🔍 DEBUG: Capturar y mostrar error detallado
+            logging.error(f"❌ Error en fetch_hubspot_records_generator")
+            logging.error(f"   After token: {after}")
+            logging.error(f"   Params keys: {list(params.keys())}")
+            raise e
 
 def process_batch(batch_records, col_map):
     """
@@ -439,13 +607,17 @@ def run_postgres_etl():
         props_res = safe_request('GET', f"https://api.hubapi.com/crm/v3/properties/{OBJECT_TYPE}")
         all_props = [p['name'] for p in props_res.json()['results']]
         
-        # Validar longitud de URL
-        url_simulated_len = len(",".join(all_props))
-        if url_simulated_len > 6000:
-            logging.warning(f"⚠️ URL muy larga ({url_simulated_len} chars). Podría fallar con 414. Considera filtrar columnas.")
+        print(f"✓ Propiedades obtenidas: {len(all_props)}")
+        
+        print("Obteniendo asociaciones disponibles...")
+        assocs = get_assocs()
+        print(f"✓ Asociaciones disponibles: {len(assocs)}")
+        
+        # Validar que el objeto soporte asociaciones
+        if not assocs:
+            print(f"⚠️ Advertencia: Objeto '{OBJECT_TYPE}' no tiene asociaciones disponibles")
         
         col_map = get_smart_mapping(all_props)
-        assocs = get_assocs()
         
         # 3. Flujo por Lotes (Generator -> Transform -> Load)
         print("🚀 Iniciando proceso ETL por lotes...")
@@ -453,8 +625,8 @@ def run_postgres_etl():
         batch_count = 0
         total_records_processed = 0
         
-        # Iteramos sobre el generador (trae 100 en 100)
-        for batch in fetch_hubspot_records_generator(all_props, assocs):
+        # Usar el generador con manejo de chunks de asociaciones
+        for batch in fetch_all_records_with_chunked_assocs(all_props, assocs):
             monitor.metrics['records_fetched'] += len(batch)
             
             # A. Transformar
