@@ -25,9 +25,9 @@ DB_NAME = os.getenv("DB_NAME")
 DB_USER = os.getenv("DB_USER")
 DB_PASS = os.getenv("DB_PASS")
 
-OBJECT_TYPE = "companies"
+OBJECT_TYPE = "services"
 DB_SCHEMA = "hubspot_etl"      
-TABLE_NAME = "companies"   
+TABLE_NAME = "services"   
 
 OUTPUT_FOLDER = "exports"
 LOG_FILE = "etl_errors.log"
@@ -165,7 +165,7 @@ def upsert_on_conflict(table, conn, keys, data_iter):
         )
     conn.execute(on_conflict_stmt)
 
-def sync_db_schema(engine, df, table_name, schema):
+def sync_db_schema(engine, df, table_name, schema, prop_types=None):
     inspector = inspect(engine)
     if not inspector.has_table(table_name, schema=schema): return
 
@@ -177,12 +177,18 @@ def sync_db_schema(engine, df, table_name, schema):
         with engine.begin() as conn:
             for col in new_cols:
                 dtype = df[col].dtype
-                pg_type = "TEXT"
-                # Lógica simple de tipos, por defecto TEXT para seguridad
-                if pd.api.types.is_integer_dtype(dtype): pg_type = "BIGINT"
-                elif pd.api.types.is_float_dtype(dtype): pg_type = "NUMERIC"
-                elif pd.api.types.is_bool_dtype(dtype): pg_type = "BOOLEAN"
-                elif pd.api.types.is_datetime64_any_dtype(dtype): pg_type = "TIMESTAMP"
+                
+                # Intentar usar el tipo de HubSpot si está disponible
+                if prop_types and col in prop_types:
+                    hubspot_type = prop_types[col]
+                    pg_type = get_postgres_type_from_hubspot(hubspot_type, dtype)
+                else:
+                    # Fallback: inferir desde pandas (comportamiento original)
+                    pg_type = "TEXT"
+                    if pd.api.types.is_integer_dtype(dtype): pg_type = "BIGINT"
+                    elif pd.api.types.is_float_dtype(dtype): pg_type = "NUMERIC"
+                    elif pd.api.types.is_bool_dtype(dtype): pg_type = "BOOLEAN"
+                    elif pd.api.types.is_datetime64_any_dtype(dtype): pg_type = "TIMESTAMP"
                 
                 # Evitamos error si la columna ya existe por concurrencia
                 try:
@@ -217,8 +223,9 @@ def initialize_db_schema(engine):
         raise e
 
 def clean_dates(df):
-    # Keywords que indican fechas REALES (no duración)
-    date_keywords = ['date', 'synced', 'timestamp', 'createdate', 'modifieddate']
+    # Keywords más específicos para evitar falsos positivos
+    # Usando "_date" o "date_" en lugar de solo "date" para evitar matches en "updated", "validated", etc.
+    date_keywords = ['_date', 'date_', 'synced', 'timestamp', 'createdate', 'modifieddate']
     
     # Excepciones: columnas que contienen "time" pero NO son fechas (son duraciones en ms)
     duration_keywords = ['cumulative_time', 'latest_time_in', 'time_in_stage', 'duration']
@@ -230,8 +237,22 @@ def clean_dates(df):
         if any(k in col_lower for k in duration_keywords):
             continue
         
-        # Si contiene keywords de fecha, intenta convertir
-        if any(k in col_lower for k in date_keywords):
+        # ⭐ Si ya fue procesada por convert_hubspot_types (es numérica/bool/datetime), NO la toques
+        # Esto evita sobreescribir conversiones correctas hechas anteriormente
+        if pd.api.types.is_numeric_dtype(df[col]) or pd.api.types.is_bool_dtype(df[col]):
+            continue
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            continue
+        
+        # Check más específico para fechas: debe empezar o terminar con "date", o tener keywords específicos
+        should_convert = False
+        
+        if col_lower.startswith('date') or col_lower.endswith('date'):
+            should_convert = True
+        elif any(k in col_lower for k in date_keywords):
+            should_convert = True
+        
+        if should_convert:
             try:
                 df[col] = pd.to_datetime(df[col], errors='coerce')
             except Exception:
@@ -356,6 +377,114 @@ def get_assocs():
     return all_assocs
 
 # --- NUEVAS FUNCIONES PARA GET / LIST ---
+
+def get_properties_with_types():
+    """
+    Obtiene todas las propiedades con sus tipos de dato desde HubSpot.
+    Retorna: (lista de nombres, diccionario de tipos)
+    """
+    url = f"https://api.hubapi.com/crm/v3/properties/{OBJECT_TYPE}"
+    res = safe_request('GET', url)
+    properties_data = res.json()['results']
+    
+    # Extraer nombres y crear mapeo de tipos
+    prop_names = []
+    prop_types = {}
+    
+    for prop in properties_data:
+        name = prop['name']
+        hubspot_type = prop.get('type', 'string')  # Default a string si no viene
+        
+        prop_names.append(name)
+        prop_types[name] = hubspot_type
+    
+    logging.info(f"Tipos de datos capturados: {len(prop_types)} propiedades")
+    return prop_names, prop_types
+
+def convert_hubspot_types_to_pandas(df, prop_types):
+    """
+    Convierte columnas del DataFrame según los tipos declarados por HubSpot.
+    Esto asegura que los datos tengan el tipo correcto antes de subirlos a PostgreSQL.
+    """
+    conversions_applied = 0
+    conversions_failed = 0
+    
+    for col in df.columns:
+        # Saltar columnas de metadata que agregamos nosotros
+        if col in ['hs_object_id', 'fivetran_synced', 'fivetran_deleted']:
+            continue
+        
+        # Saltar columnas de asociaciones
+        if col.startswith('asoc_'):
+            continue
+        
+        # Buscar el tipo en el diccionario (puede no estar si es columna generada)
+        hubspot_type = prop_types.get(col)
+        if not hubspot_type:
+            continue
+        
+        try:
+            # Mapeo de tipos HubSpot -> Pandas
+            if hubspot_type == 'number':
+                # Intentar convertir a numérico
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+                conversions_applied += 1
+                
+            elif hubspot_type in ['date', 'datetime']:
+                # Convertir a datetime
+                df[col] = pd.to_datetime(df[col], errors='coerce', utc=True)
+                conversions_applied += 1
+                
+            elif hubspot_type == 'bool':
+                # Convertir a booleano
+                # HubSpot envía "true"/"false" como strings
+                df[col] = df[col].map({'true': True, 'false': False, '': None, None: None})
+                conversions_applied += 1
+                
+            # Los tipos 'string', 'enumeration', 'phone_number' se quedan como object (texto)
+            # No necesitan conversión explícita
+            
+        except Exception as e:
+            conversions_failed += 1
+            logging.warning(f"No se pudo convertir columna '{col}' de tipo '{hubspot_type}': {e}")
+    
+    if conversions_applied > 0:
+        logging.info(f"Conversiones de tipo aplicadas: {conversions_applied} columnas (Fallos: {conversions_failed})")
+    
+    return df
+
+def get_postgres_type_from_hubspot(hubspot_type, pandas_dtype=None):
+    """
+    Mapea un tipo de HubSpot a un tipo de PostgreSQL.
+    Puede usar el dtype de pandas como fallback para mayor precisión.
+    """
+    # Mapeo directo de tipos conocidos de HubSpot
+    type_mapping = {
+        'string': 'TEXT',
+        'number': 'NUMERIC',
+        'date': 'TIMESTAMP',
+        'datetime': 'TIMESTAMP',
+        'bool': 'BOOLEAN',
+        'enumeration': 'TEXT',
+        'phone_number': 'TEXT',
+    }
+    
+    pg_type = type_mapping.get(hubspot_type)
+    
+    # Si no hay mapeo directo, usar inferencia de pandas
+    if not pg_type and pandas_dtype:
+        if pd.api.types.is_integer_dtype(pandas_dtype): 
+            pg_type = "BIGINT"
+        elif pd.api.types.is_float_dtype(pandas_dtype): 
+            pg_type = "NUMERIC"
+        elif pd.api.types.is_bool_dtype(pandas_dtype): 
+            pg_type = "BOOLEAN"
+        elif pd.api.types.is_datetime64_any_dtype(pandas_dtype): 
+            pg_type = "TIMESTAMP"
+        else:
+            pg_type = "TEXT"
+    
+    return pg_type or "TEXT"
 
 def fetch_all_records_with_chunked_assocs(properties, associations):
     """
@@ -527,7 +656,7 @@ def fetch_hubspot_records_generator(properties, associations):
             logging.error(f"   Params keys: {list(params.keys())}")
             raise e
 
-def process_batch(batch_records, col_map):
+def process_batch(batch_records, col_map, prop_types=None):
     """
     Transforma una lista de diccionarios de HubSpot en un DataFrame limpio.
     """
@@ -580,10 +709,14 @@ def process_batch(batch_records, col_map):
     # 3. Sanitizar para Postgres (longitud y duplicados)
     df = sanitize_columns_for_postgres(df)
     
-    # 4. Limpiar fechas
+    # 4. ⭐ NUEVO: Convertir tipos según HubSpot (ANTES de clean_dates)
+    if prop_types:
+        df = convert_hubspot_types_to_pandas(df, prop_types)
+    
+    # 5. Limpiar fechas (ahora solo como fallback para columnas no tipadas)
     df = clean_dates(df)
     
-    # 5. Convertir dicts/lists a JSON string para evitar error en DB
+    # 6. Convertir dicts/lists a JSON string para evitar error en DB
     for col in df.columns:
         # Verificación rápida de tipo object
         if df[col].dtype == 'object':
@@ -604,10 +737,10 @@ def run_postgres_etl():
 
         # 2. Obtener Metadatos (Propiedades y Asociaciones)
         print("Obteniendo definición de propiedades...")
-        props_res = safe_request('GET', f"https://api.hubapi.com/crm/v3/properties/{OBJECT_TYPE}")
-        all_props = [p['name'] for p in props_res.json()['results']]
+        all_props, prop_types = get_properties_with_types()
         
         print(f"✓ Propiedades obtenidas: {len(all_props)}")
+        print(f"✓ Tipos de datos mapeados: {len(prop_types)}")
         
         print("Obteniendo asociaciones disponibles...")
         assocs = get_assocs()
@@ -629,14 +762,14 @@ def run_postgres_etl():
         for batch in fetch_all_records_with_chunked_assocs(all_props, assocs):
             monitor.metrics['records_fetched'] += len(batch)
             
-            # A. Transformar
-            df_batch = process_batch(batch, col_map)
+            # A. Transformar (con tipos de HubSpot)
+            df_batch = process_batch(batch, col_map, prop_types)
             
             if df_batch.empty:
                 continue
 
-            # B. Evolución de Esquema (Checkea columnas nuevas en este lote)
-            sync_db_schema(engine, df_batch, TABLE_NAME, DB_SCHEMA)
+            # B. Evolución de Esquema (Checkea columnas nuevas en este lote, usando tipos)
+            sync_db_schema(engine, df_batch, TABLE_NAME, DB_SCHEMA, prop_types)
             
             # C. Carga a BD
             db_start_time = time.time()
