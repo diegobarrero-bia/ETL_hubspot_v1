@@ -165,7 +165,13 @@ def upsert_on_conflict(table, conn, keys, data_iter):
         )
     conn.execute(on_conflict_stmt)
 
-def sync_db_schema(engine, df, table_name, schema, prop_types=None):
+def sync_db_schema(engine, df, table_name, schema, prop_types=None, column_mapping=None):
+    """
+    Sincroniza el esquema de la BD con las columnas del DataFrame.
+    
+    Args:
+        column_mapping: dict que mapea nombre_final_columna -> nombre_original_hubspot
+    """
     inspector = inspect(engine)
     if not inspector.has_table(table_name, schema=schema): return
 
@@ -178,13 +184,23 @@ def sync_db_schema(engine, df, table_name, schema, prop_types=None):
             for col in new_cols:
                 dtype = df[col].dtype
                 
+                # Intentar obtener el nombre original de HubSpot usando el mapeo
+                original_col_name = column_mapping.get(col) if column_mapping else None
+                
                 # Intentar usar el tipo de HubSpot si está disponible
-                if prop_types and col in prop_types:
-                    hubspot_type = prop_types[col]
-                    print(f"Hubspot type found for column: {col}, using {hubspot_type}, dtype: {dtype}")
+                if prop_types and original_col_name and original_col_name in prop_types:
+                    hubspot_type = prop_types[original_col_name]
                     pg_type = get_postgres_type_from_hubspot(hubspot_type, dtype)
+                    logging.info(f"Columna '{col}' (original: '{original_col_name}'): tipo HubSpot '{hubspot_type}' → PostgreSQL '{pg_type}'")
                 else:
-                    logging.warning(f"No hubspot type found for column: {col}, using fallback")
+                    if not column_mapping:
+                        logging.warning(f"No column mapping provided for '{col}'")
+                    elif not original_col_name:
+                        logging.warning(f"No original name found in mapping for '{col}'")
+                    else:
+                        logging.warning(f"No hubspot type found for original column '{original_col_name}'")
+                    
+                    logging.warning(f"Using pandas fallback for column: {col}")
                     # Fallback: inferir desde pandas (comportamiento original)
                     pg_type = "TEXT"
                     if pd.api.types.is_integer_dtype(dtype): pg_type = "BIGINT"
@@ -626,6 +642,7 @@ def fetch_hubspot_records_generator(properties, associations):
 def process_batch(batch_records, col_map, prop_types=None):
     """
     Transforma una lista de diccionarios de HubSpot en un DataFrame limpio.
+    Retorna: (DataFrame, dict de mapeo nombre_final -> nombre_original)
     """
     data_list = []
     synced_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -663,30 +680,60 @@ def process_batch(batch_records, col_map, prop_types=None):
 
     if not data_list:
         logging.warning(f"Lote saltado: 0 registros procesados de {len(batch_records)} recibidos.")
-        return pd.DataFrame()
+        return pd.DataFrame(), {}
 
     # Creación y limpieza de DataFrame
     df = pd.DataFrame(data_list)
+    
+    # Rastrear mapeo de nombres: final → original
+    # Esto permite que sync_db_schema encuentre los tipos correctos
+    column_name_mapping = {}
+    original_columns = df.columns.tolist()
 
-    # 1. ⭐ Convertir tipos según HubSpot
+    # 1. ⭐ Convertir tipos según HubSpot (con nombres originales)
     if prop_types:
         df = convert_hubspot_types_to_pandas(df, prop_types)
 
     # 2. Renombrar columnas inteligentes (stage names)
     df.rename(columns=col_map, inplace=True)
+    
+    # Rastrear el mapeo después del primer cambio
+    for i, orig_col in enumerate(original_columns):
+        new_col = df.columns[i]
+        column_name_mapping[new_col] = orig_col
 
     # 3. Normalizar nombres (snake_case, sin acentos)
-    df.columns = [normalize_name(c) for c in df.columns]
+    normalized_cols = [normalize_name(c) for c in df.columns]
+    
+    # Actualizar mapeo: el nombre normalizado apunta al original
+    updated_mapping = {}
+    for i, norm_col in enumerate(normalized_cols):
+        old_col = df.columns[i]
+        original = column_name_mapping.get(old_col, old_col)
+        updated_mapping[norm_col] = original
+    
+    df.columns = normalized_cols
+    column_name_mapping = updated_mapping
 
     # 4. Sanitizar para Postgres (longitud y duplicados)
+    df_before_sanitize = df.copy()
     df = sanitize_columns_for_postgres(df)
+    
+    # Actualizar mapeo después de sanitizar (truncado/duplicados)
+    final_mapping = {}
+    for i, final_col in enumerate(df.columns):
+        original_from_before = column_name_mapping.get(df_before_sanitize.columns[i])
+        if original_from_before:
+            final_mapping[final_col] = original_from_before
+    
+    column_name_mapping = final_mapping
 
     # 5. Convertir dicts/lists a JSON string para evitar error en DB
     for col in df.columns:
         if df[col].dtype == 'object':
             df[col] = df[col].apply(lambda x: json.dumps(x) if isinstance(x, (dict, list)) else x)
 
-    return df
+    return df, column_name_mapping
     
 
 # --- PROCESO PRINCIPAL ---
@@ -727,14 +774,14 @@ def run_postgres_etl():
         for batch in fetch_all_records_with_chunked_assocs(all_props, assocs):
             monitor.metrics['records_fetched'] += len(batch)
             
-            # A. Transformar (con tipos de HubSpot)
-            df_batch = process_batch(batch, col_map, prop_types)
+            # A. Transformar (con tipos de HubSpot) - ahora retorna también el mapeo
+            df_batch, column_mapping = process_batch(batch, col_map, prop_types)
             
             if df_batch.empty:
                 continue
 
-            # B. Evolución de Esquema (Checkea columnas nuevas en este lote, usando tipos)
-            sync_db_schema(engine, df_batch, TABLE_NAME, DB_SCHEMA, prop_types)
+            # B. Evolución de Esquema (Checkea columnas nuevas en este lote, usando tipos y mapeo)
+            sync_db_schema(engine, df_batch, TABLE_NAME, DB_SCHEMA, prop_types, column_mapping)
             
             # C. Carga a BD
             db_start_time = time.time()
