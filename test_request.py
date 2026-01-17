@@ -181,8 +181,10 @@ def sync_db_schema(engine, df, table_name, schema, prop_types=None):
                 # Intentar usar el tipo de HubSpot si está disponible
                 if prop_types and col in prop_types:
                     hubspot_type = prop_types[col]
+                    print(f"Hubspot type found for column: {col}, using {hubspot_type}, dtype: {dtype}")
                     pg_type = get_postgres_type_from_hubspot(hubspot_type, dtype)
                 else:
+                    logging.warning(f"No hubspot type found for column: {col}, using fallback")
                     # Fallback: inferir desde pandas (comportamiento original)
                     pg_type = "TEXT"
                     if pd.api.types.is_integer_dtype(dtype): pg_type = "BIGINT"
@@ -222,43 +224,6 @@ def initialize_db_schema(engine):
         print(f"❌ Error inicializando BD: {e}")
         raise e
 
-def clean_dates(df):
-    # Keywords más específicos para evitar falsos positivos
-    # Usando "_date" o "date_" en lugar de solo "date" para evitar matches en "updated", "validated", etc.
-    date_keywords = ['_date', 'date_', 'synced', 'timestamp', 'createdate', 'modifieddate']
-    
-    # Excepciones: columnas que contienen "time" pero NO son fechas (son duraciones en ms)
-    duration_keywords = ['cumulative_time', 'latest_time_in', 'time_in_stage', 'duration']
-    
-    for col in df.columns:
-        col_lower = col.lower()
-        
-        # Si es una columna de duración, NO la toques
-        if any(k in col_lower for k in duration_keywords):
-            continue
-        
-        # ⭐ Si ya fue procesada por convert_hubspot_types (es numérica/bool/datetime), NO la toques
-        # Esto evita sobreescribir conversiones correctas hechas anteriormente
-        if pd.api.types.is_numeric_dtype(df[col]) or pd.api.types.is_bool_dtype(df[col]):
-            continue
-        if pd.api.types.is_datetime64_any_dtype(df[col]):
-            continue
-        
-        # Check más específico para fechas: debe empezar o terminar con "date", o tener keywords específicos
-        should_convert = False
-        
-        if col_lower.startswith('date') or col_lower.endswith('date'):
-            should_convert = True
-        elif any(k in col_lower for k in date_keywords):
-            should_convert = True
-        
-        if should_convert:
-            try:
-                df[col] = pd.to_datetime(df[col], errors='coerce')
-            except Exception:
-                pass
-    
-    return df
 
 # --- FUNCIONES AUXILIARES ETL ---
 def safe_request(method, url, **kwargs):
@@ -398,7 +363,7 @@ def get_properties_with_types():
         prop_names.append(name)
         prop_types[name] = hubspot_type
     
-    logging.info(f"Tipos de datos capturados: {len(prop_types)} propiedades")
+    logging.info(f"Tipos de datos capturados para: {prop_types} propiedades")
     return prop_names, prop_types
 
 def convert_hubspot_types_to_pandas(df, prop_types):
@@ -421,6 +386,7 @@ def convert_hubspot_types_to_pandas(df, prop_types):
         # Buscar el tipo en el diccionario (puede no estar si es columna generada)
         hubspot_type = prop_types.get(col)
         if not hubspot_type:
+            logging.info(f"No hubspot type found for column: {col}")
             continue
         
         try:
@@ -473,6 +439,7 @@ def get_postgres_type_from_hubspot(hubspot_type, pandas_dtype=None):
     
     # Si no hay mapeo directo, usar inferencia de pandas
     if not pg_type and pandas_dtype:
+        logging.warning(f"No postgres type found for column: {pandas_dtype}, using fallback")
         if pd.api.types.is_integer_dtype(pandas_dtype): 
             pg_type = "BIGINT"
         elif pd.api.types.is_float_dtype(pandas_dtype): 
@@ -695,38 +662,36 @@ def process_batch(batch_records, col_map, prop_types=None):
             logging.error(f"Error procesando registro {record.get('id')}: {e}")
 
     if not data_list:
+        logging.warning(f"Lote saltado: 0 registros procesados de {len(batch_records)} recibidos.")
         return pd.DataFrame()
 
     # Creación y limpieza de DataFrame
     df = pd.DataFrame(data_list)
-    
-    # 1. Renombrar columnas inteligentes (stage names)
-    df.rename(columns=col_map, inplace=True)
-    
-    # 2. Normalizar nombres (snake_case, sin acentos)
-    df.columns = [normalize_name(c) for c in df.columns]
-    
-    # 3. Sanitizar para Postgres (longitud y duplicados)
-    df = sanitize_columns_for_postgres(df)
-    
-    # 4. ⭐ NUEVO: Convertir tipos según HubSpot (ANTES de clean_dates)
+
+    # 1. ⭐ Convertir tipos según HubSpot
     if prop_types:
         df = convert_hubspot_types_to_pandas(df, prop_types)
-    
-    # 5. Limpiar fechas (ahora solo como fallback para columnas no tipadas)
-    df = clean_dates(df)
-    
-    # 6. Convertir dicts/lists a JSON string para evitar error en DB
+
+    # 2. Renombrar columnas inteligentes (stage names)
+    df.rename(columns=col_map, inplace=True)
+
+    # 3. Normalizar nombres (snake_case, sin acentos)
+    df.columns = [normalize_name(c) for c in df.columns]
+
+    # 4. Sanitizar para Postgres (longitud y duplicados)
+    df = sanitize_columns_for_postgres(df)
+
+    # 5. Convertir dicts/lists a JSON string para evitar error en DB
     for col in df.columns:
-        # Verificación rápida de tipo object
         if df[col].dtype == 'object':
-            # Aplicamos solo si el valor es lista o dict
             df[col] = df[col].apply(lambda x: json.dumps(x) if isinstance(x, (dict, list)) else x)
-            
+
     return df
+    
 
 # --- PROCESO PRINCIPAL ---
 def run_postgres_etl():
+    logging.info("\n" + "="*80 + "\n" + f"🚀 INICIANDO NUEVA CORRIDA ETL - OBJETO: {OBJECT_TYPE}" + "\n" + "="*80)
     try:
         ensure_exports_folder()
         engine = get_db_engine()
@@ -846,10 +811,13 @@ def run_postgres_etl():
 
         print("✅ Proceso finalizado.")
         monitor.generate_report()
+        logging.info(f"✅ CORRIDA FINALIZADA EXITOSAMENTE - OBJETO: {OBJECT_TYPE}\n" + "-"*80 + "\n")
 
     except Exception as e:
-        print(f"\n💀 ERROR FATAL: {e}")
-        logging.critical(f"Error Fatal: {e}")
+        print(f"\n💀 ERROR FATAL: {e.message}, error completo en logs")
+        logging.critical(f"❌ CORRIDA DETENIDA POR ERROR FATAL - OBJETO: {OBJECT_TYPE}")
+        logging.critical(f"   Detalle: {e}")
+        logging.critical("\n" + "-"*80 + "\n")
 
 if __name__ == "__main__":
     run_postgres_etl()
