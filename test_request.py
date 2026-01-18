@@ -25,9 +25,9 @@ DB_NAME = os.getenv("DB_NAME")
 DB_USER = os.getenv("DB_USER")
 DB_PASS = os.getenv("DB_PASS")
 
-OBJECT_TYPE = "services"
+OBJECT_TYPE = "leads"
 DB_SCHEMA = "hubspot_etl"      
-TABLE_NAME = "services"   
+TABLE_NAME = "leads"   
 
 OUTPUT_FOLDER = "exports"
 LOG_FILE = "etl_errors.log"
@@ -328,9 +328,10 @@ def get_smart_mapping(all_props):
     except Exception: return {}
 
     mapping = {}
-    prefixes = ["hs_v2_latest_time_in", "hs_v2_date_entered", "hs_v2_date_exited", "hs_v2_cumulative_time_in"]
+    prefixes = ["hs_v2_latest_time_in", "hs_v2_date_entered", "hs_v2_date_exited", "hs_v2_cumulative_time_in", "hs_time_in", "hs_date_exited", "hs_date_entered"]
     
     for pipe in pipelines:
+        p_lbl = pipe['label']
         for stage in pipe.get('stages', []):
             s_id = stage['id']  # ← Mantener el ID original con guiones
             s_id_normalized = s_id.replace("-", "_")  # ← Version con underscores
@@ -341,7 +342,7 @@ def get_smart_mapping(all_props):
                     # Buscar tanto con guiones como con underscores
                     if prop.startswith(pre) and (s_id in prop or s_id_normalized in prop):
                         # Mapeamos IDs técnicos a Labels legibles
-                        mapping[prop] = normalize_name(f"{pre}_{s_lbl}")
+                        mapping[prop] = normalize_name(f"{pre}_{s_lbl}_{p_lbl}")
     return mapping
 
 def get_assocs():
