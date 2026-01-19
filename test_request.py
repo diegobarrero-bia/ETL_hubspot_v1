@@ -66,9 +66,11 @@ class ETLMonitor:
             'db_execution_time': 0.0,
             'db_insert_errors': 0,
             'pipelines_loaded': 0,
-            'stages_loaded': 0
+            'stages_loaded': 0,
+            'association_tables_created': 0
         }
         self.null_stats = {}
+        self.association_tables = []  # Lista de nombres de tablas de asociaciones creadas
 
     def increment(self, metric, count=1):
         if metric in self.metrics:
@@ -77,6 +79,22 @@ class ETLMonitor:
     def set_metric(self, metric, value):
         if metric in self.metrics:
             self.metrics[metric] = value
+    
+    def add_association_table(self, table_name):
+        """Registra una tabla de asociaciones creada"""
+        if table_name not in self.association_tables:
+            self.association_tables.append(table_name)
+            self.metrics['association_tables_created'] += 1
+    
+    def _format_association_tables(self):
+        """Formatea la lista de tablas de asociaciones para el reporte"""
+        if not self.association_tables:
+            return "   - No se crearon tablas de asociaciones\n"
+        
+        tables_str = "   Tablas:\n"
+        for table in sorted(self.association_tables):
+            tables_str += f"      • {table}\n"
+        return tables_str
 
     def record_null_stats(self, df):
         # Acumulativo simple para el reporte final basado en el último lote
@@ -133,7 +151,12 @@ Estado General    : {'🟢 SALUDABLE' if m['records_failed'] == 0 and m['db_inse
    - Pipelines Cargados    : {m['pipelines_loaded']}
    - Stages Cargados       : {m['stages_loaded']}
 
-4. INTEGRIDAD & CALIDAD
+4. METADATA DE ASOCIACIONES
+---------------------------------------
+   - Tablas Creadas        : {m['association_tables_created']}
+   - Asociaciones Totales  : {m['associations_found']}
+{self._format_association_tables()}
+5. INTEGRIDAD & CALIDAD
 -----------------------------------------------
    - Schema Changes        : {m['schema_changes']}
    - Cols Truncadas        : {m['columns_truncated']}
@@ -537,6 +560,135 @@ def load_pipelines_to_db(engine, df_pipelines, df_stages):
         print(f"⚠️ No se pudieron cargar pipelines/stages a BD: {e}")
         raise e
 
+def extract_normalized_associations(batch_records):
+    """
+    Extrae las asociaciones de los registros y las normaliza.
+    Retorna un diccionario: {to_object_type: [lista de filas]}
+    
+    Solo incluye tipos de asociación que tienen datos reales.
+    
+    Ejemplo de retorno:
+    {
+        'companies': [
+            {'services_id': 123, 'companies_id': 456, 'type_id': 5, 'category': 'HUBSPOT_DEFINED'},
+            {'services_id': 123, 'companies_id': 789, 'type_id': 341, 'category': 'USER_DEFINED'},
+        ],
+        'contacts': [...]
+    }
+    """
+    synced_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    associations_by_type = {}
+    
+    for record in batch_records:
+        from_id = int(record['id'])
+        raw_assoc = record.get('associations', {})
+        
+        if not raw_assoc or not isinstance(raw_assoc, dict):
+            continue
+        
+        # raw_assoc tiene estructura: {'companies': {'results': [...]}, 'contacts': {...}}
+        for to_object_type, assoc_data in raw_assoc.items():
+            if not isinstance(assoc_data, dict):
+                continue
+            
+            results = assoc_data.get('results', [])
+            
+            for assoc_item in results:
+                if 'id' not in assoc_item:
+                    continue
+                
+                # Extraer información de la asociación
+                # Usar nombres en plural para consistencia
+                row = {
+                    f'{TABLE_NAME}_id': from_id,  # ej: 'services_id', 'deals_id'
+                    f'{to_object_type}_id': int(assoc_item['id']),  # ej: 'companies_id', 'contacts_id'
+                    'type_id': assoc_item.get('type'),  # El typeId numérico
+                    'category': assoc_item.get('category', 'HUBSPOT_DEFINED'),
+                    'fivetran_synced': synced_at
+                }
+                
+                # Agregar a la lista correspondiente
+                if to_object_type not in associations_by_type:
+                    associations_by_type[to_object_type] = []
+                
+                associations_by_type[to_object_type].append(row)
+                monitor.increment('associations_found')
+    
+    # Convertir a DataFrames solo si hay datos
+    dataframes = {}
+    for to_type, rows in associations_by_type.items():
+        if rows:  # Solo crear DataFrame si hay asociaciones reales
+            df = pd.DataFrame(rows)
+            dataframes[to_type] = df
+            logging.info(f"Asociaciones extraídas hacia '{to_type}': {len(df)} registros")
+    
+    return dataframes
+
+def load_associations_to_db(engine, associations_dataframes):
+    """
+    Carga asociaciones normalizadas en tablas relacionales.
+    Cada tipo de asociación (ej: companies, contacts) va a su propia tabla.
+    
+    Solo crea tablas para asociaciones que realmente existen (tienen datos).
+    Usa estrategia TRUNCATE + INSERT para mantener sincronizado.
+    """
+    if not associations_dataframes:
+        logging.info("No hay asociaciones para cargar")
+        return
+    
+    from_object = TABLE_NAME  # ej: 'deals', 'services' (ya en plural)
+    
+    try:
+        with engine.begin() as conn:
+            for to_object_type, df_assoc in associations_dataframes.items():
+                if df_assoc.empty:
+                    continue
+                
+                # Nombre de tabla: {from_objeto}_{to_objeto} (ambos en plural)
+                # Ejemplo: services_companies, deals_contacts
+                assoc_table_name = f"{from_object}_{to_object_type}"
+                
+                # Definir nombres de columnas dinámicamente (en plural)
+                from_col = f"{from_object}_id"
+                to_col = f"{to_object_type}_id"
+                
+                # Crear tabla si no existe
+                create_table_sql = text(f"""
+                CREATE TABLE IF NOT EXISTS {DB_SCHEMA}.{assoc_table_name} (
+                    "{from_col}" BIGINT NOT NULL,
+                    "{to_col}" BIGINT NOT NULL,
+                    "type_id" TEXT,
+                    "category" TEXT,
+                    "fivetran_synced" TIMESTAMP,
+                    PRIMARY KEY ("{from_col}", "{to_col}", "type_id")
+                );
+                """)
+                conn.execute(create_table_sql)
+                
+                # Truncar tabla (eliminar registros viejos)
+                truncate_sql = text(f'TRUNCATE TABLE {DB_SCHEMA}.{assoc_table_name}')
+                conn.execute(truncate_sql)
+                
+                # Insertar nuevos datos
+                df_assoc.to_sql(
+                    assoc_table_name,
+                    con=conn,
+                    schema=DB_SCHEMA,
+                    if_exists='append',
+                    index=False
+                )
+                
+                # Registrar tabla en el monitor
+                monitor.add_association_table(assoc_table_name)
+                
+                print(f"✅ Tabla '{assoc_table_name}' actualizada con {len(df_assoc)} asociaciones")
+                logging.info(f"Asociaciones cargadas a '{DB_SCHEMA}.{assoc_table_name}': {len(df_assoc)} registros")
+        
+    except Exception as e:
+        logging.error(f"Error cargando asociaciones a BD: {e}")
+        print(f"⚠️ Error cargando asociaciones: {e}")
+        raise e
+
 # --- NUEVAS FUNCIONES PARA GET / LIST ---
 
 def get_properties_with_types():
@@ -839,17 +991,8 @@ def process_batch(batch_records, col_map, prop_types=None):
             row["fivetran_synced"] = synced_at
             row["fivetran_deleted"] = archived
             
-            # Procesar Asociaciones (Flatten to String)
-            raw_assoc = record.get("associations")
-            if raw_assoc and isinstance(raw_assoc, dict):
-                for atype, adata in raw_assoc.items():
-                    if isinstance(adata, dict):
-                        # Nota: la estructura en GET puede variar ligeramente vs Search
-                        ids = [str(a["id"]) for a in adata.get("results", []) if "id" in a]
-                        if ids:
-                            col_name = normalize_name(f"asoc_{atype}_ids")
-                            row[col_name] = ",".join(ids)
-                            monitor.increment('associations_found')
+            # Las asociaciones se procesarán por separado y se normalizarán
+            # en tablas relacionales (NO las guardamos como strings aquí)
             
             data_list.append(row)
             monitor.increment('records_processed_ok')
@@ -1040,6 +1183,15 @@ def run_postgres_etl():
                     print(user_friendly_msg)
                     logging.error(user_friendly_msg)
                     logging.error(f"   Detalle técnico completo: {e}")
+            
+            # D. Extraer y cargar asociaciones normalizadas
+            try:
+                associations_dfs = extract_normalized_associations(batch)
+                if associations_dfs:
+                    load_associations_to_db(engine, associations_dfs)
+            except Exception as e:
+                logging.error(f"Error procesando asociaciones del lote {batch_count}: {e}")
+                print(f"⚠️ Error en asociaciones del lote {batch_count}, continuando...")
             
             monitor.metrics['db_execution_time'] += (time.time() - db_start_time)
             monitor.record_null_stats(df_batch) # Stats por lote
