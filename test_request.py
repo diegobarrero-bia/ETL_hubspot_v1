@@ -25,9 +25,13 @@ DB_NAME = os.getenv("DB_NAME")
 DB_USER = os.getenv("DB_USER")
 DB_PASS = os.getenv("DB_PASS")
 
-OBJECT_TYPE = "p50445259_meters"
+# --- CONFIGURACIÓN DE TIMEZONE ---
+import pytz
+BOGOTA_TZ = pytz.timezone('America/Bogota')  # UTC-5
+
+OBJECT_TYPE = "services"
 DB_SCHEMA = "hubspot_etl"      
-TABLE_NAME = "meters"   
+TABLE_NAME = "services"   
 
 OUTPUT_FOLDER = "exports"
 LOG_FILE = "etl_errors.log"
@@ -275,7 +279,7 @@ def sync_db_schema(engine, df, table_name, schema, prop_types=None, column_mappi
                     if pd.api.types.is_integer_dtype(dtype): pg_type = "BIGINT"
                     elif pd.api.types.is_float_dtype(dtype): pg_type = "NUMERIC"
                     elif pd.api.types.is_bool_dtype(dtype): pg_type = "BOOLEAN"
-                    elif pd.api.types.is_datetime64_any_dtype(dtype): pg_type = "TIMESTAMP"
+                    elif pd.api.types.is_datetime64_any_dtype(dtype): pg_type = "TIMESTAMPTZ"
                 
                 # Evitamos error si la columna ya existe por concurrencia
                 try:
@@ -295,7 +299,7 @@ def initialize_db_schema(engine):
     ddl_query = text(f"""
     CREATE TABLE IF NOT EXISTS {DB_SCHEMA}.{TABLE_NAME} (
         "hs_object_id" BIGINT PRIMARY KEY,
-        "hs_lastmodifieddate" TIMESTAMP,
+        "hs_lastmodifieddate" TIMESTAMPTZ,
         "fivetran_synced" TIMESTAMP,
         "fivetran_deleted" BOOLEAN
     );
@@ -494,12 +498,14 @@ def fetch_and_transform_pipelines():
         df_pipelines = pd.DataFrame(pipeline_data)
         df_stages = pd.DataFrame(stage_data)
         
-        # Convertir fechas
+        # Convertir fechas de pipelines a timezone Bogotá
         for df in [df_pipelines, df_stages]:
             if 'created_at' in df.columns:
                 df['created_at'] = pd.to_datetime(df['created_at'], errors='coerce', utc=True)
+                df['created_at'] = df['created_at'].dt.tz_convert(BOGOTA_TZ)
             if 'updated_at' in df.columns:
                 df['updated_at'] = pd.to_datetime(df['updated_at'], errors='coerce', utc=True)
+                df['updated_at'] = df['updated_at'].dt.tz_convert(BOGOTA_TZ)
         
         logging.info(f"Pipelines extraídos: {len(df_pipelines)} pipelines, {len(df_stages)} stages")
         return df_pipelines, df_stages
@@ -533,8 +539,8 @@ def load_pipelines_to_db(engine, df_pipelines, df_stages):
                 "pipeline_id" TEXT PRIMARY KEY,
                 "label" TEXT,
                 "display_order" INTEGER,
-                "created_at" TIMESTAMP,
-                "updated_at" TIMESTAMP,
+                "created_at" TIMESTAMPTZ,
+                "updated_at" TIMESTAMPTZ,
                 "archived" BOOLEAN,
                 "fivetran_deleted" BOOLEAN,
                 "fivetran_synced" TIMESTAMP
@@ -549,8 +555,8 @@ def load_pipelines_to_db(engine, df_pipelines, df_stages):
                 "pipeline_id" TEXT,
                 "label" TEXT,
                 "display_order" INTEGER,
-                "created_at" TIMESTAMP,
-                "updated_at" TIMESTAMP,
+                "created_at" TIMESTAMPTZ,
+                "updated_at" TIMESTAMPTZ,
                 "archived" BOOLEAN,
                 "state" TEXT,
                 "fivetran_deleted" BOOLEAN,
@@ -786,8 +792,10 @@ def convert_hubspot_types_to_pandas(df, prop_types):
                 conversions_applied += 1
                 
             elif hubspot_type in ['date', 'datetime']:
-                # Convertir a datetime
+                # Convertir a datetime con timezone de Bogotá
+                # Primero a UTC, luego convertir a Bogotá
                 df[col] = pd.to_datetime(df[col], errors='coerce', utc=True)
+                df[col] = df[col].dt.tz_convert(BOGOTA_TZ)
                 conversions_applied += 1
                 
             elif hubspot_type == 'bool':
@@ -817,8 +825,8 @@ def get_postgres_type_from_hubspot(hubspot_type, pandas_dtype=None):
     type_mapping = {
         'string': 'TEXT',
         'number': 'NUMERIC',
-        'date': 'TIMESTAMP',
-        'datetime': 'TIMESTAMP',
+        'date': 'TIMESTAMPTZ',
+        'datetime': 'TIMESTAMPTZ',
         'bool': 'BOOLEAN',
         'enumeration': 'TEXT',
         'phone_number': 'TEXT',
@@ -836,7 +844,7 @@ def get_postgres_type_from_hubspot(hubspot_type, pandas_dtype=None):
         elif pd.api.types.is_bool_dtype(pandas_dtype): 
             pg_type = "BOOLEAN"
         elif pd.api.types.is_datetime64_any_dtype(pandas_dtype): 
-            pg_type = "TIMESTAMP"
+            pg_type = "TIMESTAMPTZ"
         else:
             pg_type = "TEXT"
     
