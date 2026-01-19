@@ -25,9 +25,9 @@ DB_NAME = os.getenv("DB_NAME")
 DB_USER = os.getenv("DB_USER")
 DB_PASS = os.getenv("DB_PASS")
 
-OBJECT_TYPE = "leads"
+OBJECT_TYPE = "p50445259_meters"
 DB_SCHEMA = "hubspot_etl"      
-TABLE_NAME = "leads"   
+TABLE_NAME = "meters"   
 
 OUTPUT_FOLDER = "exports"
 LOG_FILE = "etl_errors.log"
@@ -71,6 +71,7 @@ class ETLMonitor:
         }
         self.null_stats = {}
         self.association_tables = []  # Lista de nombres de tablas de asociaciones creadas
+        self.truncated_columns = []   # Lista de (original, truncado) para columnas truncadas
 
     def increment(self, metric, count=1):
         if metric in self.metrics:
@@ -86,6 +87,13 @@ class ETLMonitor:
             self.association_tables.append(table_name)
             self.metrics['association_tables_created'] += 1
     
+    def add_truncated_column(self, original, truncated):
+        """Registra una columna que fue truncada"""
+        # Evitar duplicados (puede ocurrir en múltiples lotes)
+        truncation = (original, truncated)
+        if truncation not in self.truncated_columns:
+            self.truncated_columns.append(truncation)
+    
     def _format_association_tables(self):
         """Formatea la lista de tablas de asociaciones para el reporte"""
         if not self.association_tables:
@@ -95,6 +103,29 @@ class ETLMonitor:
         for table in sorted(self.association_tables):
             tables_str += f"      • {table}\n"
         return tables_str
+    
+    def _format_truncated_columns(self, max_display=10):
+        """Formatea la lista de columnas truncadas para el reporte"""
+        if not self.truncated_columns:
+            return ""
+        
+        total = len(self.truncated_columns)
+        display_count = min(total, max_display)
+        
+        # Ordenar por nombre original para facilitar búsqueda
+        sorted_truncations = sorted(self.truncated_columns, key=lambda x: x[0])
+        
+        truncations_str = f"\n   [Columnas Truncadas - Mostrando {display_count} de {total}]\n"
+        for original, truncated in sorted_truncations[:display_count]:
+            # Mostrar solo los primeros 70 chars del original
+            orig_display = original if len(original) <= 70 else original[:67] + "..."
+            truncations_str += f"   • {orig_display}\n"
+            truncations_str += f"     → {truncated}\n"
+        
+        if total > max_display:
+            truncations_str += f"   ... y {total - max_display} más (ver logs para lista completa)\n"
+        
+        return truncations_str
 
     def record_null_stats(self, df):
         # Acumulativo simple para el reporte final basado en el último lote
@@ -160,6 +191,7 @@ Estado General    : {'🟢 SALUDABLE' if m['records_failed'] == 0 and m['db_inse
 -----------------------------------------------
    - Schema Changes        : {m['schema_changes']}
    - Cols Truncadas        : {m['columns_truncated']}
+{self._format_truncated_columns()}
    {nulls_report}
 ==================================================
 """
@@ -168,6 +200,13 @@ Estado General    : {'🟢 SALUDABLE' if m['records_failed'] == 0 and m['db_inse
             with open(REPORT_FILE, "w", encoding="utf-8") as f:
                 f.write(report)
             print(f"📄 Reporte guardado en: {REPORT_FILE}")
+            
+            # Guardar lista completa de columnas truncadas en log si hay muchas
+            if len(self.truncated_columns) > 10:
+                logging.info(f"Lista completa de {len(self.truncated_columns)} columnas truncadas:")
+                for original, truncated in sorted(self.truncated_columns):
+                    logging.info(f"  '{original}' → '{truncated}'")
+                    
         except Exception as e:
             logging.error(f"Error guardando reporte: {e}")
 
@@ -339,6 +378,8 @@ def sanitize_columns_for_postgres(df):
         sanitized = col[:63] # Cortar a 63 chars
         if len(col) > 63:
             monitor.increment('columns_truncated')
+            # Registrar qué columna fue truncada
+            monitor.add_truncated_column(col, sanitized)
         
         if sanitized in seen:
             seen[sanitized] += 1
