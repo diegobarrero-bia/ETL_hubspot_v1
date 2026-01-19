@@ -64,7 +64,9 @@ class ETLMonitor:
             'associations_missing': 0, 'db_upserts': 0,
             'schema_changes': 0,
             'db_execution_time': 0.0,
-            'db_insert_errors': 0
+            'db_insert_errors': 0,
+            'pipelines_loaded': 0,
+            'stages_loaded': 0
         }
         self.null_stats = {}
 
@@ -126,7 +128,12 @@ Estado General    : {'🟢 SALUDABLE' if m['records_failed'] == 0 and m['db_inse
    - Tiempo DB (aprox)     : {m['db_execution_time']:.2f} s
    - Errores DB            : {m['db_insert_errors']}
 
-3. INTEGRIDAD & CALIDAD
+3. METADATA DE PIPELINES
+---------------------------------------
+   - Pipelines Cargados    : {m['pipelines_loaded']}
+   - Stages Cargados       : {m['stages_loaded']}
+
+4. INTEGRIDAD & CALIDAD
 -----------------------------------------------
    - Schema Changes        : {m['schema_changes']}
    - Cols Truncadas        : {m['columns_truncated']}
@@ -357,6 +364,178 @@ def get_assocs():
         print(f"ℹ️ Se encontraron {len(all_assocs)} asociaciones. Se procesarán en múltiples llamadas (límite API: 30)")
     
     return all_assocs
+
+def fetch_and_transform_pipelines():
+    """
+    Extrae la información de pipelines con sus stages y la convierte en DataFrames.
+    Retorna: (df_pipelines, df_stages) o (None, None) si no hay pipelines disponibles.
+    
+    Referencia: https://developers.hubspot.com/docs/api-reference/crm-pipelines-v3/guide
+    """
+    try:
+        url = f"https://api.hubapi.com/crm/v3/pipelines/{OBJECT_TYPE}"
+        res = safe_request('GET', url)
+        pipelines = res.json().get('results', [])
+        
+        if not pipelines:
+            logging.info(f"No hay pipelines para el objeto '{OBJECT_TYPE}'")
+            return None, None
+        
+        # Transformar pipelines a lista de diccionarios
+        pipeline_data = []
+        stage_data = []
+        synced_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        
+        for pipe in pipelines:
+            # Información del pipeline
+            pipeline_row = {
+                'pipeline_id': pipe.get('id'),
+                'label': pipe.get('label'),
+                'display_order': pipe.get('displayOrder', 1),
+                'created_at': pipe.get('createdAt'),
+                'updated_at': pipe.get('updatedAt'),
+                'archived': pipe.get('archived', False),
+                'fivetran_deleted': False,
+                'fivetran_synced': synced_at
+            }
+            pipeline_data.append(pipeline_row)
+            
+            # Información de los stages de este pipeline
+            stages = pipe.get('stages', [])
+            for stage in stages:
+                stage_row = {
+                    'stage_id': stage.get('id'),
+                    'pipeline_id': pipe.get('id'),
+                    'label': stage.get('label'),
+                    'display_order': stage.get('displayOrder', 0),
+                    'created_at': stage.get('createdAt'),
+                    'updated_at': stage.get('updatedAt'),
+                    'archived': stage.get('archived', False),
+                    'fivetran_deleted': False,
+                    'fivetran_synced': synced_at
+                }
+                
+                # Metadata puede variar según el tipo de objeto
+                # Extraer 'state' o 'leadState' si existe
+                metadata = stage.get('metadata', {})
+                if metadata:
+                    # Buscar state o leadState en el metadata
+                    state_value = metadata.get('state') or metadata.get('leadState')
+                    if state_value:
+                        stage_row['state'] = state_value
+                
+                stage_data.append(stage_row)
+        
+        # Crear DataFrames
+        df_pipelines = pd.DataFrame(pipeline_data)
+        df_stages = pd.DataFrame(stage_data)
+        
+        # Convertir fechas
+        for df in [df_pipelines, df_stages]:
+            if 'created_at' in df.columns:
+                df['created_at'] = pd.to_datetime(df['created_at'], errors='coerce', utc=True)
+            if 'updated_at' in df.columns:
+                df['updated_at'] = pd.to_datetime(df['updated_at'], errors='coerce', utc=True)
+        
+        logging.info(f"Pipelines extraídos: {len(df_pipelines)} pipelines, {len(df_stages)} stages")
+        return df_pipelines, df_stages
+        
+    except Exception as e:
+        logging.warning(f"No se pudieron obtener pipelines para '{OBJECT_TYPE}': {e}")
+        return None, None
+
+def load_pipelines_to_db(engine, df_pipelines, df_stages):
+    """
+    Carga la información de pipelines y stages a tablas separadas.
+    Usa estrategia TRUNCATE + INSERT para mantener sincronizado.
+    
+    Esto asegura que:
+    - Si se elimina un pipeline/stage en HubSpot, desaparecerá de la tabla
+    - No hay conflictos de duplicados
+    - La metadata siempre está actualizada
+    """
+    if df_pipelines is None or df_pipelines.empty:
+        logging.info("No hay pipelines para cargar a BD")
+        return
+    
+    pipeline_table_name = f"{TABLE_NAME}_pipelines"
+    stages_table_name = f"{TABLE_NAME}_pipeline_stages"
+    
+    try:
+        with engine.begin() as conn:
+            # 1. Crear tabla de pipelines si no existe
+            create_pipeline_table_sql = text(f"""
+            CREATE TABLE IF NOT EXISTS {DB_SCHEMA}.{pipeline_table_name} (
+                "pipeline_id" TEXT PRIMARY KEY,
+                "label" TEXT,
+                "display_order" INTEGER,
+                "created_at" TIMESTAMP,
+                "updated_at" TIMESTAMP,
+                "archived" BOOLEAN,
+                "fivetran_deleted" BOOLEAN,
+                "fivetran_synced" TIMESTAMP
+            );
+            """)
+            conn.execute(create_pipeline_table_sql)
+            
+            # 2. Crear tabla de stages si no existe
+            create_stages_table_sql = text(f"""
+            CREATE TABLE IF NOT EXISTS {DB_SCHEMA}.{stages_table_name} (
+                "stage_id" TEXT PRIMARY KEY,
+                "pipeline_id" TEXT,
+                "label" TEXT,
+                "display_order" INTEGER,
+                "created_at" TIMESTAMP,
+                "updated_at" TIMESTAMP,
+                "archived" BOOLEAN,
+                "state" TEXT,
+                "fivetran_deleted" BOOLEAN,
+                "fivetran_synced" TIMESTAMP,
+                FOREIGN KEY ("pipeline_id") REFERENCES {DB_SCHEMA}.{pipeline_table_name}("pipeline_id")
+            );
+            """)
+            conn.execute(create_stages_table_sql)
+            
+            # 3. Truncar tablas (eliminar registros viejos)
+            # Orden importante: primero stages (tiene FK), luego pipelines
+            truncate_stages_sql = text(f'TRUNCATE TABLE {DB_SCHEMA}.{stages_table_name} CASCADE')
+            truncate_pipeline_sql = text(f'TRUNCATE TABLE {DB_SCHEMA}.{pipeline_table_name} CASCADE')
+            conn.execute(truncate_stages_sql)
+            conn.execute(truncate_pipeline_sql)
+            
+            # 4. Insertar pipelines
+            df_pipelines.to_sql(
+                pipeline_table_name,
+                con=conn,
+                schema=DB_SCHEMA,
+                if_exists='append',
+                index=False
+            )
+            monitor.set_metric('pipelines_loaded', len(df_pipelines))
+            
+            # 5. Insertar stages
+            if df_stages is not None and not df_stages.empty:
+                df_stages.to_sql(
+                    stages_table_name,
+                    con=conn,
+                    schema=DB_SCHEMA,
+                    if_exists='append',
+                    index=False
+                )
+                monitor.set_metric('stages_loaded', len(df_stages))
+            
+        print(f"✅ Tabla '{pipeline_table_name}' actualizada con {len(df_pipelines)} pipelines")
+        if df_stages is not None and not df_stages.empty:
+            print(f"✅ Tabla '{stages_table_name}' actualizada con {len(df_stages)} stages")
+        
+        logging.info(f"Pipelines cargados a '{DB_SCHEMA}.{pipeline_table_name}': {len(df_pipelines)} registros")
+        if df_stages is not None:
+            logging.info(f"Stages cargados a '{DB_SCHEMA}.{stages_table_name}': {len(df_stages)} registros")
+        
+    except Exception as e:
+        logging.error(f"Error cargando pipelines/stages a BD: {e}")
+        print(f"⚠️ No se pudieron cargar pipelines/stages a BD: {e}")
+        raise e
 
 # --- NUEVAS FUNCIONES PARA GET / LIST ---
 
@@ -762,6 +941,18 @@ def run_postgres_etl():
         # Validar que el objeto soporte asociaciones
         if not assocs:
             print(f"⚠️ Advertencia: Objeto '{OBJECT_TYPE}' no tiene asociaciones disponibles")
+        
+        # 2.5 Obtener y cargar información de Pipelines y Stages
+        print("\n📊 Obteniendo información de pipelines...")
+        df_pipelines, df_stages = fetch_and_transform_pipelines()
+        if df_pipelines is not None:
+            print(f"✓ Pipelines encontrados: {len(df_pipelines)}")
+            if df_stages is not None:
+                print(f"✓ Stages encontrados: {len(df_stages)}")
+            load_pipelines_to_db(engine, df_pipelines, df_stages)
+        else:
+            print(f"ℹ️ Objeto '{OBJECT_TYPE}' no tiene pipelines o no están disponibles")
+            logging.info(f"Objeto '{OBJECT_TYPE}' no soporta pipelines o no hay pipelines configurados")
         
         col_map = get_smart_mapping(all_props)
         
