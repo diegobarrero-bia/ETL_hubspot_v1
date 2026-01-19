@@ -17,6 +17,35 @@ from sqlalchemy.types import Integer, BigInteger, Text, Boolean, DateTime, Float
 
 load_dotenv()
 
+# --- VALIDACIÓN DE VARIABLES DE ENTORNO ---
+def validate_env():
+    """
+    Valida que todas las variables de entorno críticas estén configuradas.
+    Falla rápido si falta alguna, evitando errores tardíos en el proceso.
+    """
+    required_vars = {
+        "ACCESS_TOKEN": "Token de acceso a la API de HubSpot",
+        "DB_HOST": "Host de la base de datos PostgreSQL",
+        "DB_NAME": "Nombre de la base de datos",
+        "DB_USER": "Usuario de la base de datos",
+        "DB_PASS": "Contraseña de la base de datos"
+    }
+    
+    missing = []
+    for var, description in required_vars.items():
+        value = os.getenv(var)
+        if not value or value.strip() == "":
+            missing.append(f"{var} ({description})")
+    
+    if missing:
+        error_msg = "❌ Variables de entorno faltantes o vacías:\n"
+        for var in missing:
+            error_msg += f"   • {var}\n"
+        error_msg += "\n💡 Verifica tu archivo .env"
+        raise EnvironmentError(error_msg)
+    
+    print("✅ Variables de entorno validadas")
+
 # --- CONFIGURACIÓN ---
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 DB_HOST = os.getenv("DB_HOST")
@@ -40,17 +69,67 @@ LOG_FILE = "etl_errors.log"
 report_timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 REPORT_FILE = os.path.join(OUTPUT_FOLDER, f"etl_health_report_{report_timestamp}.txt")
 
+# --- CONFIGURACIÓN DE LOGGING POR NIVELES ---
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+VALID_LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+
+# Validar nivel de log
+if LOG_LEVEL not in VALID_LEVELS:
+    print(f"⚠️ LOG_LEVEL inválido '{LOG_LEVEL}', usando 'INFO'")
+    LOG_LEVEL = "INFO"
+
+# Convertir string a constante de logging
+NUMERIC_LEVEL = getattr(logging, LOG_LEVEL, logging.INFO)
+
+# Configurar logging a archivo
 logging.basicConfig(
     filename=LOG_FILE,
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    level=NUMERIC_LEVEL,
+    format='%(asctime)s - %(levelname)s - [%(funcName)s:%(lineno)d] - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    force=True
 )
+
+# Agregar handler para consola (opcional, solo para DEBUG)
+if LOG_LEVEL == "DEBUG":
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.DEBUG)
+    console_formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%H:%M:%S'
+    )
+    console_handler.setFormatter(console_formatter)
+    logging.getLogger().addHandler(console_handler)
+    print(f"🔍 Modo DEBUG activado - Logs detallados en consola y archivo")
+else:
+    print(f"📊 Nivel de log configurado: {LOG_LEVEL}")
 
 headers = {
     'Authorization': f'Bearer {ACCESS_TOKEN}',
     'Content-Type': 'application/json'
 }
+
+# --- FUNCIONES AUXILIARES DE LOGGING ---
+def log_debug(message):
+    """Log solo en modo DEBUG"""
+    if LOG_LEVEL == "DEBUG":
+        logging.debug(message)
+
+def log_info(message):
+    """Log en modo INFO y superior"""
+    logging.info(message)
+
+def log_warning(message):
+    """Log siempre (WARNING y superior)"""
+    logging.warning(message)
+
+def log_error(message):
+    """Log siempre (ERROR y superior)"""
+    logging.error(message)
+
+def log_critical(message):
+    """Log siempre (CRITICAL)"""
+    logging.critical(message)
 
 def ensure_exports_folder():
     if not os.path.exists(OUTPUT_FOLDER):
@@ -207,12 +286,12 @@ Estado General    : {'🟢 SALUDABLE' if m['records_failed'] == 0 and m['db_inse
             
             # Guardar lista completa de columnas truncadas en log si hay muchas
             if len(self.truncated_columns) > 10:
-                logging.info(f"Lista completa de {len(self.truncated_columns)} columnas truncadas:")
+                log_info(f"Lista completa de {len(self.truncated_columns)} columnas truncadas:")
                 for original, truncated in sorted(self.truncated_columns):
-                    logging.info(f"  '{original}' → '{truncated}'")
+                    log_info(f"  '{original}' → '{truncated}'")
                     
         except Exception as e:
-            logging.error(f"Error guardando reporte: {e}")
+            log_error(f"Error guardando reporte: {e}")
 
 monitor = ETLMonitor()
 
@@ -264,16 +343,16 @@ def sync_db_schema(engine, df, table_name, schema, prop_types=None, column_mappi
                 if prop_types and original_col_name and original_col_name in prop_types:
                     hubspot_type = prop_types[original_col_name]
                     pg_type = get_postgres_type_from_hubspot(hubspot_type, dtype)
-                    logging.info(f"Columna '{col}' (original: '{original_col_name}'): tipo HubSpot '{hubspot_type}' → PostgreSQL '{pg_type}'")
+                    log_debug(f"Columna '{col}' (original: '{original_col_name}'): tipo HubSpot '{hubspot_type}' → PostgreSQL '{pg_type}'")
                 else:
                     if not column_mapping:
-                        logging.warning(f"No column mapping provided for '{col}'")
+                        log_warning(f"No column mapping provided for '{col}'")
                     elif not original_col_name:
-                        logging.warning(f"No original name found in mapping for '{col}'")
+                        log_warning(f"No original name found in mapping for '{col}'")
                     else:
-                        logging.warning(f"No hubspot type found for original column '{original_col_name}'")
+                        log_warning(f"No hubspot type found for original column '{original_col_name}'")
                     
-                    logging.warning(f"Using pandas fallback for column: {col}")
+                    log_warning(f"Using pandas fallback for column: {col}")
                     # Fallback: inferir desde pandas (comportamiento original)
                     pg_type = "TEXT"
                     if pd.api.types.is_integer_dtype(dtype): pg_type = "BIGINT"
@@ -285,9 +364,9 @@ def sync_db_schema(engine, df, table_name, schema, prop_types=None, column_mappi
                 try:
                     conn.execute(text(f'ALTER TABLE "{schema}"."{table_name}" ADD COLUMN "{col}" {pg_type}'))
                     monitor.increment('schema_changes')
-                    logging.info(f"Columna creada: {col} ({pg_type})")
+                    log_info(f"Columna creada: {col} ({pg_type})")
                 except Exception as e:
-                    logging.warning(f"Error al crear columna {col} (puede que ya exista): {e}")
+                    log_warning(f"Error al crear columna {col} (puede que ya exista): {e}")
 
 def initialize_db_schema(engine):
     """
@@ -428,7 +507,7 @@ def get_assocs():
     
     # Retornar todas las asociaciones (se procesarán en chunks después)
     if len(all_assocs) > 30:
-        logging.info(f"ℹ️ Objeto tiene {len(all_assocs)} asociaciones. Se procesarán en chunks de 30.")
+        log_info(f"ℹ️ Objeto tiene {len(all_assocs)} asociaciones. Se procesarán en chunks de 30.")
         print(f"ℹ️ Se encontraron {len(all_assocs)} asociaciones. Se procesarán en múltiples llamadas (límite API: 30)")
     
     return all_assocs
@@ -446,7 +525,7 @@ def fetch_and_transform_pipelines():
         pipelines = res.json().get('results', [])
         
         if not pipelines:
-            logging.info(f"No hay pipelines para el objeto '{OBJECT_TYPE}'")
+            log_info(f"No hay pipelines para el objeto '{OBJECT_TYPE}'")
             return None, None
         
         # Transformar pipelines a lista de diccionarios
@@ -507,11 +586,11 @@ def fetch_and_transform_pipelines():
                 df['updated_at'] = pd.to_datetime(df['updated_at'], errors='coerce', utc=True)
                 df['updated_at'] = df['updated_at'].dt.tz_convert(BOGOTA_TZ)
         
-        logging.info(f"Pipelines extraídos: {len(df_pipelines)} pipelines, {len(df_stages)} stages")
+        log_info(f"Pipelines extraídos: {len(df_pipelines)} pipelines, {len(df_stages)} stages")
         return df_pipelines, df_stages
         
     except Exception as e:
-        logging.warning(f"No se pudieron obtener pipelines para '{OBJECT_TYPE}': {e}")
+        log_warning(f"No se pudieron obtener pipelines para '{OBJECT_TYPE}': {e}")
         return None, None
 
 def load_pipelines_to_db(engine, df_pipelines, df_stages):
@@ -525,7 +604,7 @@ def load_pipelines_to_db(engine, df_pipelines, df_stages):
     - La metadata siempre está actualizada
     """
     if df_pipelines is None or df_pipelines.empty:
-        logging.info("No hay pipelines para cargar a BD")
+        log_info("No hay pipelines para cargar a BD")
         return
     
     pipeline_table_name = f"{TABLE_NAME}_pipelines"
@@ -598,12 +677,12 @@ def load_pipelines_to_db(engine, df_pipelines, df_stages):
         if df_stages is not None and not df_stages.empty:
             print(f"✅ Tabla '{stages_table_name}' actualizada con {len(df_stages)} stages")
         
-        logging.info(f"Pipelines cargados a '{DB_SCHEMA}.{pipeline_table_name}': {len(df_pipelines)} registros")
+        log_info(f"Pipelines cargados a '{DB_SCHEMA}.{pipeline_table_name}': {len(df_pipelines)} registros")
         if df_stages is not None:
-            logging.info(f"Stages cargados a '{DB_SCHEMA}.{stages_table_name}': {len(df_stages)} registros")
+            log_info(f"Stages cargados a '{DB_SCHEMA}.{stages_table_name}': {len(df_stages)} registros")
         
     except Exception as e:
-        logging.error(f"Error cargando pipelines/stages a BD: {e}")
+        log_error(f"Error cargando pipelines/stages a BD: {e}")
         print(f"⚠️ No se pudieron cargar pipelines/stages a BD: {e}")
         raise e
 
@@ -667,7 +746,7 @@ def extract_normalized_associations(batch_records):
         if rows:  # Solo crear DataFrame si hay asociaciones reales
             df = pd.DataFrame(rows)
             dataframes[to_type] = df
-            logging.info(f"Asociaciones extraídas hacia '{to_type}': {len(df)} registros")
+            log_info(f"Asociaciones extraídas hacia '{to_type}': {len(df)} registros")
     
     return dataframes
 
@@ -680,7 +759,7 @@ def load_associations_to_db(engine, associations_dataframes):
     Usa estrategia TRUNCATE + INSERT para mantener sincronizado.
     """
     if not associations_dataframes:
-        logging.info("No hay asociaciones para cargar")
+        log_info("No hay asociaciones para cargar")
         return
     
     from_object = TABLE_NAME  # ej: 'deals', 'services' (ya en plural)
@@ -729,10 +808,10 @@ def load_associations_to_db(engine, associations_dataframes):
                 monitor.add_association_table(assoc_table_name)
                 
                 print(f"✅ Tabla '{assoc_table_name}' actualizada con {len(df_assoc)} asociaciones")
-                logging.info(f"Asociaciones cargadas a '{DB_SCHEMA}.{assoc_table_name}': {len(df_assoc)} registros")
+                log_info(f"Asociaciones cargadas a '{DB_SCHEMA}.{assoc_table_name}': {len(df_assoc)} registros")
         
     except Exception as e:
-        logging.error(f"Error cargando asociaciones a BD: {e}")
+        log_error(f"Error cargando asociaciones a BD: {e}")
         print(f"⚠️ Error cargando asociaciones: {e}")
         raise e
 
@@ -758,7 +837,7 @@ def get_properties_with_types():
         prop_names.append(name)
         prop_types[name] = hubspot_type
     
-    logging.info(f"Tipos de datos capturados para: {prop_types} propiedades")
+    log_debug(f"Tipos de datos capturados para {len(prop_types)} propiedades")
     return prop_names, prop_types
 
 def convert_hubspot_types_to_pandas(df, prop_types):
@@ -781,7 +860,7 @@ def convert_hubspot_types_to_pandas(df, prop_types):
         # Buscar el tipo en el diccionario (puede no estar si es columna generada)
         hubspot_type = prop_types.get(col)
         if not hubspot_type:
-            logging.info(f"No hubspot type found for column: {col}")
+            log_debug(f"No hubspot type found for column: {col}")
             continue
         
         try:
@@ -809,10 +888,10 @@ def convert_hubspot_types_to_pandas(df, prop_types):
             
         except Exception as e:
             conversions_failed += 1
-            logging.warning(f"No se pudo convertir columna '{col}' de tipo '{hubspot_type}': {e}")
+            log_warning(f"No se pudo convertir columna '{col}' de tipo '{hubspot_type}': {e}")
     
     if conversions_applied > 0:
-        logging.info(f"Conversiones de tipo aplicadas: {conversions_applied} columnas (Fallos: {conversions_failed})")
+        log_info(f"Conversiones de tipo aplicadas: {conversions_applied} columnas (Fallos: {conversions_failed})")
     
     return df
 
@@ -836,7 +915,7 @@ def get_postgres_type_from_hubspot(hubspot_type, pandas_dtype=None):
     
     # Si no hay mapeo directo, usar inferencia de pandas
     if not pg_type and pandas_dtype:
-        logging.warning(f"No postgres type found for column: {pandas_dtype}, using fallback")
+        log_warning(f"No postgres type found for hubspot type '{hubspot_type}', using fallback")
         if pd.api.types.is_integer_dtype(pandas_dtype): 
             pg_type = "BIGINT"
         elif pd.api.types.is_float_dtype(pandas_dtype): 
@@ -867,7 +946,7 @@ def fetch_all_records_with_chunked_assocs(properties, associations):
     assoc_chunks = [associations[i:i + chunk_size] for i in range(0, len(associations), chunk_size)]
     
     print(f"\n🔄 Dividiendo {len(associations)} asociaciones en {len(assoc_chunks)} llamadas API")
-    logging.info(f"Procesando asociaciones en {len(assoc_chunks)} chunks de máximo {chunk_size}")
+    log_info(f"Procesando asociaciones en {len(assoc_chunks)} chunks de máximo {chunk_size}")
     
     # Diccionario para almacenar y combinar registros por ID
     all_records_dict = {}
@@ -972,11 +1051,11 @@ def fetch_hubspot_records_generator(properties, associations):
             f"   Propiedades: {len(properties)} ({len(properties_str)} chars)\n"
             f"   Considera reducir propiedades o usar POST/Search endpoint."
         )
-        logging.warning(warning_msg)
+        log_warning(warning_msg)
         print(warning_msg)
     elif estimated_url_length > 6000:
         warning_msg = f"⚠️ Advertencia: URL larga ({estimated_url_length} chars). Podría fallar."
-        logging.warning(warning_msg)
+        log_warning(warning_msg)
         print(warning_msg)
     else:
         print(f"✓ Longitud URL aceptable")
@@ -1015,9 +1094,9 @@ def fetch_hubspot_records_generator(properties, associations):
                 
         except Exception as e:
             # 🔍 DEBUG: Capturar y mostrar error detallado
-            logging.error(f"❌ Error en fetch_hubspot_records_generator")
-            logging.error(f"   After token: {after}")
-            logging.error(f"   Params keys: {list(params.keys())}")
+            log_error(f"❌ Error en fetch_hubspot_records_generator")
+            log_error(f"   After token: {after}")
+            log_error(f"   Params keys: {list(params.keys())}")
             raise e
 
 def process_batch(batch_records, col_map, prop_types=None):
@@ -1048,10 +1127,10 @@ def process_batch(batch_records, col_map, prop_types=None):
             
         except Exception as e:
             monitor.increment('records_failed')
-            logging.error(f"Error procesando registro {record.get('id')}: {e}")
+            log_error(f"Error procesando registro {record.get('id')}: {e}")
 
     if not data_list:
-        logging.warning(f"Lote saltado: 0 registros procesados de {len(batch_records)} recibidos.")
+        log_warning(f"Lote saltado: 0 registros procesados de {len(batch_records)} recibidos.")
         return pd.DataFrame(), {}
 
     # Creación y limpieza de DataFrame
@@ -1110,8 +1189,12 @@ def process_batch(batch_records, col_map, prop_types=None):
 
 # --- PROCESO PRINCIPAL ---
 def run_postgres_etl():
-    logging.info("\n" + "="*80 + "\n" + f"🚀 INICIANDO NUEVA CORRIDA ETL - OBJETO: {OBJECT_TYPE}" + "\n" + "="*80)
+    log_info("\n" + "="*80 + "\n" + f"🚀 INICIANDO NUEVA CORRIDA ETL - OBJETO: {OBJECT_TYPE}" + "\n" + "="*80)
     try:
+        # Validar variables de entorno críticas
+        validate_env()
+        log_info("✅ Validación de variables de entorno exitosa")
+        
         ensure_exports_folder()
         engine = get_db_engine()
         print("✅ Motor de BD iniciado.")
@@ -1144,7 +1227,7 @@ def run_postgres_etl():
             load_pipelines_to_db(engine, df_pipelines, df_stages)
         else:
             print(f"ℹ️ Objeto '{OBJECT_TYPE}' no tiene pipelines o no están disponibles")
-            logging.info(f"Objeto '{OBJECT_TYPE}' no soporta pipelines o no hay pipelines configurados")
+            log_info(f"Objeto '{OBJECT_TYPE}' no soporta pipelines o no hay pipelines configurados")
         
         col_map = get_smart_mapping(all_props)
         
@@ -1200,8 +1283,8 @@ def run_postgres_etl():
                     )
                     
                     print(user_friendly_msg)
-                    logging.error(user_friendly_msg)
-                    logging.error(f"   Detalle técnico completo: {e}")
+                    log_error(user_friendly_msg)
+                    log_error(f"   Detalle técnico completo: {e}")
                 
                 # 2. Errores de Integridad (Duplicados, FKs, etc.)
                 elif 'IntegrityError' in error_type or 'duplicate key' in error_msg.lower():
@@ -1210,8 +1293,8 @@ def run_postgres_etl():
                         f"   Problema: Violación de constraint de base de datos"
                     )
                     print(user_friendly_msg)
-                    logging.error(user_friendly_msg)
-                    logging.error(f"   Detalle técnico completo: {e}")
+                    log_error(user_friendly_msg)
+                    log_error(f"   Detalle técnico completo: {e}")
                 
                 # 3. Errores de Columna (nombre inválido, no existe, etc.)
                 elif 'ProgrammingError' in error_type or 'column' in error_msg.lower():
@@ -1220,8 +1303,8 @@ def run_postgres_etl():
                         f"   Problema: Error en definición de columna o tabla"
                     )
                     print(user_friendly_msg)
-                    logging.error(user_friendly_msg)
-                    logging.error(f"   Detalle técnico completo: {e}")
+                    log_error(user_friendly_msg)
+                    log_error(f"   Detalle técnico completo: {e}")
                 
                 # 4. Error Genérico (mantener para otros casos)
                 else:
@@ -1230,8 +1313,8 @@ def run_postgres_etl():
                         f"   Tipo: {error_type}"
                     )
                     print(user_friendly_msg)
-                    logging.error(user_friendly_msg)
-                    logging.error(f"   Detalle técnico completo: {e}")
+                    log_error(user_friendly_msg)
+                    log_error(f"   Detalle técnico completo: {e}")
             
             # D. Extraer y cargar asociaciones normalizadas
             try:
@@ -1239,7 +1322,7 @@ def run_postgres_etl():
                 if associations_dfs:
                     load_associations_to_db(engine, associations_dfs)
             except Exception as e:
-                logging.error(f"Error procesando asociaciones del lote {batch_count}: {e}")
+                log_error(f"Error procesando asociaciones del lote {batch_count}: {e}")
                 print(f"⚠️ Error en asociaciones del lote {batch_count}, continuando...")
             
             monitor.metrics['db_execution_time'] += (time.time() - db_start_time)
@@ -1251,13 +1334,62 @@ def run_postgres_etl():
 
         print("✅ Proceso finalizado.")
         monitor.generate_report()
-        logging.info(f"✅ CORRIDA FINALIZADA EXITOSAMENTE - OBJETO: {OBJECT_TYPE}\n" + "-"*80 + "\n")
+        log_info(f"✅ CORRIDA FINALIZADA EXITOSAMENTE - OBJETO: {OBJECT_TYPE}\n" + "-"*80 + "\n")
 
     except Exception as e:
-        print(f"\n💀 ERROR FATAL: {e.message}, error completo en logs")
-        logging.critical(f"❌ CORRIDA DETENIDA POR ERROR FATAL - OBJETO: {OBJECT_TYPE}")
-        logging.critical(f"   Detalle: {e}")
-        logging.critical("\n" + "-"*80 + "\n")
+        error_msg = f"💥 ERROR FATAL: {type(e).__name__} - {str(e)}"
+        print(f"\n{error_msg}")
+        print(f"📄 Ver detalles completos en: {LOG_FILE}")
+        
+        log_critical(f"❌ CORRIDA DETENIDA POR ERROR FATAL - OBJETO: {OBJECT_TYPE}")
+        log_critical(f"   Tipo: {type(e).__name__}")
+        log_critical(f"   Detalle: {e}", exc_info=True)
+        log_critical("\n" + "-"*80 + "\n")
+        
+        # Re-lanzar la excepción para que sea manejada por __main__
+        raise
 
 if __name__ == "__main__":
-    run_postgres_etl()
+    import sys
+    
+    try:
+        print("=" * 60)
+        print("  🚀 ETL HUBSPOT → POSTGRESQL")
+        print(f"  📦 Objeto: {OBJECT_TYPE}")
+        print(f"  🗄️  Destino: {DB_SCHEMA}.{TABLE_NAME}")
+        print("=" * 60 + "\n")
+        
+        run_postgres_etl()
+        
+        print("\n" + "=" * 60)
+        print("  🎉 ETL COMPLETADA EXITOSAMENTE")
+        print("=" * 60)
+        
+        log_info("✅ Proceso ETL finalizado con exit code 0")
+        sys.exit(0)
+        
+    except EnvironmentError as e:
+        # Error de configuración (variables faltantes)
+        print(f"\n💥 ERROR DE CONFIGURACIÓN:\n{e}\n")
+        log_critical(f"Error de configuración: {e}")
+        sys.exit(2)  # Exit code 2 para errores de configuración
+        
+    except KeyboardInterrupt:
+        print("\n\n⚠️ Proceso interrumpido por el usuario (Ctrl+C)")
+        log_warning("Proceso interrumpido manualmente")
+        sys.exit(130)  # Exit code estándar para SIGINT
+        
+    except Exception as e:
+        print(f"\n💥 ERROR FATAL EN ETL:")
+        print(f"   Tipo: {type(e).__name__}")
+        print(f"   Mensaje: {str(e)}")
+        print(f"\n📄 Ver detalles completos en: {LOG_FILE}\n")
+        
+        log_critical("=" * 80)
+        log_critical(f"❌ ETL DETENIDO POR ERROR FATAL - OBJETO: {OBJECT_TYPE}")
+        log_critical(f"   Tipo de error: {type(e).__name__}")
+        log_critical(f"   Detalle: {e}")
+        log_critical(f"   Traceback completo:", exc_info=True)
+        log_critical("=" * 80)
+        
+        sys.exit(1)  # Exit code 1 para errores de ejecución
