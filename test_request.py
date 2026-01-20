@@ -473,6 +473,62 @@ def sanitize_columns_for_postgres(df):
     df.columns = new_cols
     return df
 
+def get_initials(text):
+    """
+    Obtener iniciales de un texto, se usa para reducir el largo de los nombres de las columnas
+    de pipelines.
+    """
+    if not text:
+        return ""
+    # Primero normalizamos para quitar acentos y caracteres raros
+    normalized = normalize_name(text)
+    # Dividimos por guiones bajos
+    parts = [p for p in normalized.split("_") if p]
+    # Tomamos la primera letra de cada palabra y las unimos con '_'
+    initials = "_".join([p[0] for p in parts])
+    return initials
+
+def get_smart_mapping(all_props):
+    """
+    Obtiene el mapeo de las columnas de las propiedades de los pipelines.
+    Se usa para reducir el largo de los nombres de las columnas de las propiedades de los pipelines.
+    """
+    try:
+        url = f"https://api.hubapi.com/crm/v3/pipelines/{OBJECT_TYPE}"
+        res = safe_request('GET', url)
+        pipelines = res.json().get('results', [])
+    except Exception: return {}
+
+    mapping = {}
+    # Prefijos acortados sin _v2, para ganar más espacio
+    prefix_map = {
+        "hs_v2_cumulative_time_in": "hs_cumulative_time_in",
+        "hs_v2_date_entered": "hs_date_entered",
+        "hs_v2_date_exited": "hs_date_exited",
+        "hs_v2_latest_time_in": "hs_latest_time_in",
+        "hs_time_in": "hs_time_in",
+        "hs_date_exited": "hs_date_exited",
+        "hs_date_entered": "hs_date_entered"
+    }
+    
+    for pipe in pipelines:
+        #Generamos el acrónimo del Pipeline
+        p_initials = get_initials(pipe['label']) 
+
+        for stage in pipe.get('stages', []):
+            s_id = stage['id']
+            s_id_normalized = s_id.replace("-", "_")
+            s_lbl = stage['label'] 
+            
+            for prop in all_props:
+                for pre, short_pre in prefix_map.items():
+                    if prop.startswith(pre) and (s_id in prop or s_id_normalized in prop):
+                        new_name = f"{short_pre}_{s_lbl}_in_{p_initials}_pipeline"
+                        mapping[prop] = normalize_name(new_name)
+                        
+    return mapping
+
+"""
 def get_smart_mapping(all_props):
     # Intentamos obtener pipelines para mapeo inteligente de stages
     try:
@@ -498,6 +554,7 @@ def get_smart_mapping(all_props):
                         # Mapeamos IDs técnicos a Labels legibles
                         mapping[prop] = normalize_name(f"{pre}_{s_lbl}_{p_lbl}")
     return mapping
+"""
 
 def get_assocs():
     # Obtiene asociaciones disponibles
