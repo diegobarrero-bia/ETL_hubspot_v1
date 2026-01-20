@@ -58,9 +58,9 @@ DB_PASS = os.getenv("DB_PASS")
 import pytz
 BOGOTA_TZ = pytz.timezone('America/Bogota')  # UTC-5
 
-OBJECT_TYPE = "services"
+OBJECT_TYPE = "contacts"
 DB_SCHEMA = "hubspot_etl"      
-TABLE_NAME = "services"   
+TABLE_NAME = "contacts"   
 
 OUTPUT_FOLDER = "exports"
 LOG_FILE = "etl_errors.log"
@@ -747,17 +747,9 @@ def extract_normalized_associations(batch_records):
     """
     Extrae las asociaciones de los registros y las normaliza.
     Retorna un diccionario: {to_object_type: [lista de filas]}
-    
+
     Solo incluye tipos de asociación que tienen datos reales.
-    
-    Ejemplo de retorno:
-    {
-        'companies': [
-            {'services_id': 123, 'companies_id': 456, 'type_id': 5, 'category': 'HUBSPOT_DEFINED'},
-            {'services_id': 123, 'companies_id': 789, 'type_id': 341, 'category': 'USER_DEFINED'},
-        ],
-        'contacts': [...]
-    }
+    Incluye todas las asociaciones, incluso las self-references.
     """
     synced_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     associations_by_type = {}
@@ -770,7 +762,8 @@ def extract_normalized_associations(batch_records):
             continue
         
         # raw_assoc tiene estructura: {'companies': {'results': [...]}, 'contacts': {...}}
-        for to_object_type, assoc_data in raw_assoc.items():
+        for to_object_type_raw, assoc_data in raw_assoc.items():
+            to_object_type = normalize_name(to_object_type_raw)  # Normalizar
             if not isinstance(assoc_data, dict):
                 continue
             
@@ -781,11 +774,20 @@ def extract_normalized_associations(batch_records):
                     continue
                 
                 # Extraer información de la asociación
-                # Usar nombres en plural para consistencia
+                # Detectar self-reference para usar nombres diferenciados
+                if TABLE_NAME == to_object_type:
+                    # Caso especial: self-reference (ej: contacts → contacts)
+                    from_col = f'from_{TABLE_NAME}_id'
+                    to_col = f'to_{to_object_type}_id'
+                else:
+                    # Caso normal
+                    from_col = f'{TABLE_NAME}_id'
+                    to_col = f'{to_object_type}_id'
+
                 row = {
-                    f'{TABLE_NAME}_id': from_id,  # ej: 'services_id', 'deals_id'
-                    f'{to_object_type}_id': int(assoc_item['id']),  # ej: 'companies_id', 'contacts_id'
-                    'type_id': assoc_item.get('type'),  # El typeId numérico
+                    from_col: from_id,                    # 'from_contacts_id' o 'contacts_id'
+                    to_col: int(assoc_item['id']),       # 'to_contacts_id' o 'companies_id'
+                    'type_id': assoc_item.get('type'),
                     'category': assoc_item.get('category', 'HUBSPOT_DEFINED'),
                     'fivetran_synced': synced_at
                 }
@@ -832,8 +834,14 @@ def load_associations_to_db(engine, associations_dataframes):
                 assoc_table_name = f"{from_object}_{to_object_type}"
                 
                 # Definir nombres de columnas dinámicamente (en plural)
-                from_col = f"{from_object}_id"
-                to_col = f"{to_object_type}_id"
+                if from_object == to_object_type:
+                    # Caso especial: self-reference (ej: contacts → contacts)
+                    from_col = f"from_{from_object}_id"
+                    to_col = f"to_{to_object_type}_id"
+                else:
+                    # Caso normal
+                    from_col = f"{from_object}_id"
+                    to_col = f"{to_object_type}_id"
                 
                 # Crear tabla si no existe
                 create_table_sql = text(f"""
