@@ -523,7 +523,7 @@ def get_smart_mapping(all_props):
             for prop in all_props:
                 for pre, short_pre in prefix_map.items():
                     if prop.startswith(pre) and (s_id in prop or s_id_normalized in prop):
-                        new_name = f"{short_pre}_{s_lbl}_in_{p_initials}_pipeline"
+                        new_name = f"{short_pre}_{s_lbl}_in_{p_initials}_pipe"
                         mapping[prop] = normalize_name(new_name)
                         
     return mapping
