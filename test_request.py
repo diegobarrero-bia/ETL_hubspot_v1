@@ -58,9 +58,9 @@ DB_PASS = os.getenv("DB_PASS")
 import pytz
 BOGOTA_TZ = pytz.timezone('America/Bogota')  # UTC-5
 
-OBJECT_TYPE = "contacts"
+OBJECT_TYPE = "companies"
 DB_SCHEMA = "hubspot_etl"      
-TABLE_NAME = "contacts"   
+TABLE_NAME = "companies"   
 
 OUTPUT_FOLDER = "exports"
 LOG_FILE = "etl_errors.log"
@@ -110,26 +110,26 @@ headers = {
 }
 
 # --- FUNCIONES AUXILIARES DE LOGGING ---
-def log_debug(message):
+def log_debug(message, **kwargs):
     """Log solo en modo DEBUG"""
     if LOG_LEVEL == "DEBUG":
-        logging.debug(message)
+        logging.debug(message, **kwargs)
 
-def log_info(message):
+def log_info(message, **kwargs):
     """Log en modo INFO y superior"""
-    logging.info(message)
+    logging.info(message, **kwargs)
 
-def log_warning(message):
+def log_warning(message, **kwargs):
     """Log siempre (WARNING y superior)"""
-    logging.warning(message)
+    logging.warning(message, **kwargs)
 
-def log_error(message):
+def log_error(message, **kwargs):
     """Log siempre (ERROR y superior)"""
-    logging.error(message)
+    logging.error(message, **kwargs)
 
-def log_critical(message):
+def log_critical(message, **kwargs):
     """Log siempre (CRITICAL)"""
-    logging.critical(message)
+    logging.critical(message, **kwargs)
 
 def ensure_exports_folder():
     if not os.path.exists(OUTPUT_FOLDER):
