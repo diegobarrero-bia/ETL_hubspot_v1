@@ -58,9 +58,9 @@ DB_PASS = os.getenv("DB_PASS")
 import pytz
 BOGOTA_TZ = pytz.timezone('America/Bogota')  # UTC-5
 
-OBJECT_TYPE = "companies"
+OBJECT_TYPE = "services"
 DB_SCHEMA = "hubspot_etl"      
-TABLE_NAME = "companies"   
+TABLE_NAME = "services"   
 
 OUTPUT_FOLDER = "exports"
 LOG_FILE = "etl_errors.log"
@@ -473,25 +473,16 @@ def sanitize_columns_for_postgres(df):
     df.columns = new_cols
     return df
 
-def get_initials(text):
-    """
-    Obtener iniciales de un texto, se usa para reducir el largo de los nombres de las columnas
-    de pipelines.
-    """
-    if not text:
-        return ""
-    # Primero normalizamos para quitar acentos y caracteres raros
-    normalized = normalize_name(text)
-    # Dividimos por guiones bajos
-    parts = [p for p in normalized.split("_") if p]
-    # Tomamos la primera letra de cada palabra y las unimos con '_'
-    initials = "_".join([p[0] for p in parts])
-    return initials
-
 def get_smart_mapping(all_props):
     """
-    Obtiene el mapeo de las columnas de las propiedades de los pipelines.
-    Se usa para reducir el largo de los nombres de las columnas de las propiedades de los pipelines.
+    Simplifica los nombres de columnas de propiedades de pipelines eliminando sufijos numéricos.
+    
+    Convierte nombres como:
+      hs_v2_date_entered_600b692d_a3fe_4052_9cd7_278b134d7941_2005647967
+    A:
+      hs_v2_date_entered_600b692d_a3fe_4052_9cd7_278b134d7941
+    
+    Mantiene solo: prefijo + stage_id (sin el sufijo numérico final)
     """
     try:
         url = f"https://api.hubapi.com/crm/v3/pipelines/{OBJECT_TYPE}"
@@ -500,61 +491,34 @@ def get_smart_mapping(all_props):
     except Exception: return {}
 
     mapping = {}
-    # Prefijos acortados sin _v2, para ganar más espacio
-    prefix_map = {
-        "hs_v2_cumulative_time_in": "hs_cumulative_time_in",
-        "hs_v2_date_entered": "hs_date_entered",
-        "hs_v2_date_exited": "hs_date_exited",
-        "hs_v2_latest_time_in": "hs_latest_time_in",
-        "hs_time_in": "hs_time_in",
-        "hs_date_exited": "hs_date_exited",
-        "hs_date_entered": "hs_date_entered"
-    }
+    
+    # Prefijos que identifican propiedades de pipeline/stage
+    prefixes = [
+        "hs_v2_cumulative_time_in",
+        "hs_v2_date_entered",
+        "hs_v2_date_exited",
+        "hs_v2_latest_time_in",
+        "hs_time_in",
+        "hs_date_exited",
+        "hs_date_entered"
+    ]
     
     for pipe in pipelines:
-        #Generamos el acrónimo del Pipeline
-        p_initials = get_initials(pipe['label']) 
-
         for stage in pipe.get('stages', []):
-            s_id = stage['id']
-            s_id_normalized = s_id.replace("-", "_")
-            s_lbl = stage['label'] 
+            s_id = stage['id']  # ID original con guiones: 600b692d-a3fe-4052-9cd7-278b134d7941
+            s_id_normalized = s_id.replace("-", "_")  # Con underscores: 600b692d_a3fe_4052_9cd7_278b134d7941
             
             for prop in all_props:
-                for pre, short_pre in prefix_map.items():
-                    if prop.startswith(pre) and (s_id in prop or s_id_normalized in prop):
-                        new_name = f"{short_pre}_{s_lbl}_in_{p_initials}_pipe"
-                        mapping[prop] = normalize_name(new_name)
+                for prefix in prefixes:
+                    # Verificar si la propiedad contiene el stage ID (en cualquier formato)
+                    if prop.startswith(prefix) and (s_id in prop or s_id_normalized in prop):
+                        # Nuevo nombre: prefijo + stage_id normalizado
+                        # Ejemplo: hs_v2_date_entered_600b692d_a3fe_4052_9cd7_278b134d7941
+                        new_name = f"{prefix}_{s_id_normalized}"
+                        mapping[prop] = new_name
+                        break  # Ya encontramos un match, pasar a la siguiente propiedad
                         
     return mapping
-
-"""
-def get_smart_mapping(all_props):
-    # Intentamos obtener pipelines para mapeo inteligente de stages
-    try:
-        url = f"https://api.hubapi.com/crm/v3/pipelines/{OBJECT_TYPE}"
-        res = safe_request('GET', url)
-        pipelines = res.json().get('results', [])
-    except Exception: return {}
-
-    mapping = {}
-    prefixes = ["hs_v2_latest_time_in", "hs_v2_date_entered", "hs_v2_date_exited", "hs_v2_cumulative_time_in", "hs_time_in", "hs_date_exited", "hs_date_entered"]
-    
-    for pipe in pipelines:
-        p_lbl = pipe['label']
-        for stage in pipe.get('stages', []):
-            s_id = stage['id']  # ← Mantener el ID original con guiones
-            s_id_normalized = s_id.replace("-", "_")  # ← Version con underscores
-            s_lbl = stage['label']
-            
-            for prop in all_props:
-                for pre in prefixes:
-                    # Buscar tanto con guiones como con underscores
-                    if prop.startswith(pre) and (s_id in prop or s_id_normalized in prop):
-                        # Mapeamos IDs técnicos a Labels legibles
-                        mapping[prop] = normalize_name(f"{pre}_{s_lbl}_{p_lbl}")
-    return mapping
-"""
 
 def get_assocs():
     # Obtiene asociaciones disponibles
