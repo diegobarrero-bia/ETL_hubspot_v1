@@ -209,8 +209,14 @@ def handler(event: dict, context=None) -> dict:
 # CLI (modo local)
 # =====================================================================
 
-def _setup_logging(level: str = "INFO") -> None:
-    """Configura logging según el entorno."""
+def _setup_logging(level: str = "INFO", log_file: str = None) -> None:
+    """
+    Configura logging según el entorno.
+    
+    Args:
+        level: Nivel de logging (DEBUG, INFO, etc.)
+        log_file: Ruta opcional para guardar logs en archivo (solo modo local)
+    """
     level = level.upper()
     valid = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
     if level not in valid:
@@ -223,6 +229,7 @@ def _setup_logging(level: str = "INFO") -> None:
     root_logger.setLevel(numeric_level)
 
     if not root_logger.handlers:
+        # Handler para consola (siempre presente)
         console_handler = logging.StreamHandler()
         console_handler.setLevel(numeric_level)
         formatter = logging.Formatter(
@@ -231,6 +238,17 @@ def _setup_logging(level: str = "INFO") -> None:
         )
         console_handler.setFormatter(formatter)
         root_logger.addHandler(console_handler)
+        
+        # Handler para archivo (solo si se especifica)
+        if log_file:
+            try:
+                file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
+                file_handler.setLevel(numeric_level)
+                file_handler.setFormatter(formatter)
+                root_logger.addHandler(file_handler)
+                print(f"📄 Logs guardándose en: {log_file}")
+            except Exception as e:
+                logger.warning("No se pudo crear archivo de log '%s': %s", log_file, e)
 
 
 def main() -> None:
@@ -248,7 +266,7 @@ def main() -> None:
 Ejemplos:
   python handler.py --object-type contacts
   python handler.py --object-type deals --log-level DEBUG
-  python handler.py --object-type services
+  python handler.py --object-type services --log-file etl_errors.log
         """,
     )
     parser.add_argument(
@@ -262,10 +280,14 @@ Ejemplos:
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         help="Nivel de logging (default: INFO)",
     )
+    parser.add_argument(
+        "--log-file",
+        help="Ruta del archivo para guardar logs (opcional). Si se proporciona, los logs se verán en pantalla Y se guardarán en el archivo.",
+    )
 
     args = parser.parse_args()
 
-    _setup_logging(args.log_level)
+    _setup_logging(args.log_level, args.log_file)
 
     print("=" * 60)
     print("  ETL HUBSPOT -> POSTGRESQL")

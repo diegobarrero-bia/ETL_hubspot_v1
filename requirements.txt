@@ -1,6 +1,0 @@
-requests
-pandas
-python-dotenv
-openpyxl
-sycopg2-binary
-sqlalchemy
