@@ -11,6 +11,9 @@ load_dotenv()
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 OBJECT_TYPE = "services"
 
+# Variable global: ID del servicio a inspeccionar
+SERVICE_ID_TO_INSPECT = "513220187805"  # ⬅️ Cambiar este valor según el ID que quieras revisar
+
 headers = {
     'Authorization': f'Bearer {ACCESS_TOKEN}',
     'Content-Type': 'application/json'
@@ -150,6 +153,7 @@ def inspect_specific_service(service_id):
         print(f"❌ Error: {e}")
 
 if __name__ == "__main__":
-    target_id = input("Introduce el ID del Service: ").strip()
-    if target_id:
-        inspect_specific_service(target_id)
+    if SERVICE_ID_TO_INSPECT:
+        inspect_specific_service(SERVICE_ID_TO_INSPECT)
+    else:
+        print("⚠️ Por favor define SERVICE_ID_TO_INSPECT en el código")
