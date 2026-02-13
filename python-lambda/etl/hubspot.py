@@ -22,6 +22,7 @@ class HubSpotExtractor:
         self.monitor = monitor
         self.headers = config.headers
         self._assoc_name_map: dict[str, str] = {}
+        self._schema_object_name: str | None = None
 
     # -----------------------------------------------------------------
     # Request con reintentos
@@ -147,6 +148,10 @@ class HubSpotExtractor:
         our_type_id = schema_data.get('objectTypeId', '')
         our_name = schema_data.get('name', '').upper()
 
+        # Guardar nombre del schema como nombre base para tablas
+        if our_name:
+            self._schema_object_name = our_name.lower()
+
         if our_name:
             prefix = f"{our_name}_TO_"
             suffix = f"_TO_{our_name}"
@@ -211,6 +216,10 @@ class HubSpotExtractor:
     def get_assoc_name(self, type_id: str) -> str:
         """Retorna el nombre legible de un objectTypeId, o el ID normalizado como fallback."""
         return self._assoc_name_map.get(type_id, type_id.replace('-', '_'))
+
+    def get_schema_name(self) -> str:
+        """Retorna el nombre del schema HubSpot (e.g., 'service') o fallback a object_type."""
+        return self._schema_object_name or self.config.object_type
 
     # -----------------------------------------------------------------
     # Pipelines

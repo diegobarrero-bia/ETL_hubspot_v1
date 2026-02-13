@@ -233,8 +233,8 @@ class DatabaseLoader:
 
         schema = self.config.db_schema
         table = self.config.table_name
-        pipeline_table = f"{table}_pipelines"
-        stages_table = f"{table}_pipeline_stages"
+        pipeline_table = f"{table}_pipeline"
+        stages_table = f"{table}_pipeline_stage"
 
         try:
             with self.engine.begin() as conn:

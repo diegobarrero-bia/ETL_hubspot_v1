@@ -52,25 +52,29 @@ def run_etl(config) -> dict:
         table_name=config.table_name,
     )
 
-    logger.info(
-        "INICIANDO ETL - Objeto: %s, Destino: %s.%s",
-        config.object_type, config.db_schema, config.table_name,
-    )
-
     # 1. Inicializar componentes
     extractor = HubSpotExtractor(config, monitor)
     loader = DatabaseLoader(config, monitor)
 
-    # 2. Preparar BD
-    loader.initialize_schema()
-    logger.info("Esquema de BD inicializado.")
-
-    # 3. Obtener metadata (propiedades y asociaciones)
+    # 2. Obtener metadata (propiedades y asociaciones)
     all_props, prop_types = extractor.get_properties_with_types()
     logger.info("Propiedades obtenidas: %d", len(all_props))
 
     assocs = extractor.get_associations()
     logger.info("Asociaciones disponibles: %d", len(assocs))
+
+    # 3. Resolver nombre del schema HubSpot como nombre base de tablas
+    config.table_name = extractor.get_schema_name()
+    monitor.table_name = config.table_name
+
+    logger.info(
+        "INICIANDO ETL - Objeto: %s, Destino: %s.%s",
+        config.object_type, config.db_schema, config.table_name,
+    )
+
+    # 4. Preparar BD
+    loader.initialize_schema()
+    logger.info("Esquema de BD inicializado.")
 
     # 4. Pipelines y stages
     pipelines = extractor.get_pipelines()
