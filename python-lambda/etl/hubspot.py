@@ -2,6 +2,7 @@
 import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
@@ -20,6 +21,7 @@ class HubSpotExtractor:
         self.config = config
         self.monitor = monitor
         self.headers = config.headers
+        self._assoc_name_map: dict[str, str] = {}
 
     # -----------------------------------------------------------------
     # Request con reintentos
@@ -35,7 +37,7 @@ class HubSpotExtractor:
             try:
                 res = requests.request(method, url, headers=self.headers, **kwargs)
 
-                if res.status_code == 200:
+                if res.status_code in (200, 207):
                     return res
 
                 elif res.status_code == 400:
@@ -111,21 +113,104 @@ class HubSpotExtractor:
     # -----------------------------------------------------------------
 
     def get_associations(self) -> list[str]:
-        """Obtiene las asociaciones disponibles para el tipo de objeto."""
+        """Obtiene las asociaciones disponibles (deduplicadas) y resuelve nombres."""
         url = f"{self.BASE_URL}/schemas/{self.config.object_type}"
         res = self.safe_request('GET', url)
-        all_assocs = [
+        schema_data = res.json()
+
+        all_assocs = list(set(
             a['toObjectTypeId']
-            for a in res.json().get('associations', [])
-        ]
+            for a in schema_data.get('associations', [])
+        ))
 
         if len(all_assocs) > 30:
             logger.info(
-                "Objeto tiene %d asociaciones. Se procesarán en chunks de 30.",
+                "Objeto tiene %d asociaciones únicas.",
                 len(all_assocs),
             )
 
+        # Resolver IDs a nombres legibles
+        self._resolve_assoc_names(schema_data, all_assocs)
+
         return all_assocs
+
+    def _resolve_assoc_names(
+        self, schema_data: dict, type_ids: list[str]
+    ) -> None:
+        """
+        Resuelve objectTypeId → nombre legible usando 3 estrategias:
+        1. Parseo del campo 'name' de las asociaciones del schema (0 API calls)
+        2. GET /crm/v3/schemas para objetos custom (1 API call)
+        3. GET /crm/v3/schemas/{id} individual para no resueltos (paralelo)
+        """
+        # Estrategia 1: Parsear nombres de asociación del schema
+        our_type_id = schema_data.get('objectTypeId', '')
+        our_name = schema_data.get('name', '').upper()
+
+        if our_name:
+            prefix = f"{our_name}_TO_"
+            suffix = f"_TO_{our_name}"
+
+            for assoc in schema_data.get('associations', []):
+                from_id = assoc.get('fromObjectTypeId', '')
+                to_id = assoc.get('toObjectTypeId', '')
+                assoc_name = assoc.get('name', '').upper()
+
+                if from_id == our_type_id and assoc_name.startswith(prefix):
+                    target_name = assoc_name[len(prefix):].lower()
+                    if target_name:
+                        self._assoc_name_map[to_id] = target_name
+                elif to_id == our_type_id and assoc_name.endswith(suffix):
+                    source_name = assoc_name[:-len(suffix)].lower()
+                    if source_name:
+                        self._assoc_name_map[from_id] = source_name
+
+        # Estrategia 2: GET /crm/v3/schemas para custom objects
+        remaining = [tid for tid in type_ids if tid not in self._assoc_name_map]
+        if remaining:
+            try:
+                schemas_url = f"{self.BASE_URL}/schemas"
+                schemas_res = self.safe_request('GET', schemas_url)
+                for schema in schemas_res.json().get('results', []):
+                    oid = schema.get('objectTypeId', '')
+                    name = schema.get('name', '').lower()
+                    if oid and name:
+                        self._assoc_name_map[oid] = name
+            except Exception as e:
+                logger.warning("Error obteniendo schemas para nombres: %s", e)
+
+        # Estrategia 3: Resolución individual para no resueltos
+        still_remaining = [tid for tid in type_ids if tid not in self._assoc_name_map]
+        if still_remaining:
+            logger.info(
+                "Resolviendo %d tipos de asociación por API individual",
+                len(still_remaining),
+            )
+
+            def _resolve_one(type_id):
+                try:
+                    schema_url = f"{self.BASE_URL}/schemas/{type_id}"
+                    res = self.safe_request('GET', schema_url)
+                    return type_id, res.json().get('name', '').lower()
+                except Exception:
+                    return type_id, None
+
+            with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
+                futures = [executor.submit(_resolve_one, tid) for tid in still_remaining]
+                for future in as_completed(futures):
+                    tid, name = future.result()
+                    if name:
+                        self._assoc_name_map[tid] = name
+
+        resolved = sum(1 for tid in type_ids if tid in self._assoc_name_map)
+        logger.info(
+            "Nombres de asociación resueltos: %d/%d",
+            resolved, len(type_ids),
+        )
+
+    def get_assoc_name(self, type_id: str) -> str:
+        """Retorna el nombre legible de un objectTypeId, o el ID normalizado como fallback."""
+        return self._assoc_name_map.get(type_id, type_id.replace('-', '_'))
 
     # -----------------------------------------------------------------
     # Pipelines
@@ -209,10 +294,9 @@ class HubSpotExtractor:
         url = f"{self.BASE_URL}/objects/{self.config.object_type}"
 
         properties_str = ",".join(properties)
-        associations_str = ",".join(associations) if associations else ""
 
         # Validar longitud URL
-        estimated_url_length = len(url) + len(properties_str) + len(associations_str) + 100
+        estimated_url_length = len(url) + len(properties_str) + 100
         if estimated_url_length > 8000:
             logger.warning(
                 "URL demasiado larga (%d chars). Podría fallar con error 414.",
@@ -222,9 +306,12 @@ class HubSpotExtractor:
         params = {
             "limit": 100,
             "properties": properties_str,
-            "associations": associations_str,
             "archived": "false",
         }
+
+        # Solo incluir associations si hay (enviar "" causa error 400 en HubSpot)
+        if associations:
+            params["associations"] = ",".join(associations)
 
         logger.info(
             "Iniciando descarga GET - %s (props: %d, assocs: %d)",
@@ -256,74 +343,242 @@ class HubSpotExtractor:
                 logger.error("Error en fetch_records_generator, after=%s", after)
                 raise e
 
+    # -----------------------------------------------------------------
+    # Asociaciones v4 (batch read)
+    # -----------------------------------------------------------------
+
+    def fetch_associations_batch(
+        self, object_ids: list[str], from_type: str, to_type: str
+    ) -> dict[str, list[dict]]:
+        """
+        Obtiene asociaciones usando el endpoint batch v4.
+
+        POST /crm/v4/associations/{fromObjectType}/{toObjectType}/batch/read
+        Máximo 1000 IDs por request.
+
+        Returns:
+            dict {from_id: [{"id": str, "type": str, "category": str}, ...]}
+        """
+        url = f"https://api.hubapi.com/crm/v4/associations/{from_type}/{to_type}/batch/read"
+        result: dict[str, list[dict]] = {}
+
+        chunk_size = 1000
+        for i in range(0, len(object_ids), chunk_size):
+            chunk = object_ids[i:i + chunk_size]
+            body = {"inputs": [{"id": oid} for oid in chunk]}
+
+            try:
+                res = self.safe_request('POST', url, json=body)
+                data = res.json()
+
+                for item in data.get('results', []):
+                    from_obj = item.get('from', {})
+                    from_id = str(from_obj.get('id', ''))
+                    to_list = item.get('to', [])
+
+                    if not from_id:
+                        continue
+
+                    if from_id not in result:
+                        result[from_id] = []
+
+                    # Normalizar formato v4 a v3 para compatibilidad con
+                    # extract_normalized_associations en transform.py
+                    for to_item in to_list:
+                        to_id = to_item.get('toObjectId')
+                        for assoc_type_info in to_item.get('associationTypes', []):
+                            normalized = {
+                                'id': str(to_id),
+                                'type': str(assoc_type_info.get('typeId', '')),
+                                'category': assoc_type_info.get(
+                                    'category', 'HUBSPOT_DEFINED'
+                                ),
+                            }
+                            result[from_id].append(normalized)
+
+            except Exception as e:
+                logger.error(
+                    "Error en batch associations %s -> %s (chunk %d): %s",
+                    from_type, to_type, i // chunk_size + 1, e,
+                )
+                raise
+
+        return result
+
+    # -----------------------------------------------------------------
+    # Estrategia optimizada: registros + asociaciones separadas
+    # -----------------------------------------------------------------
+
+    def fetch_records_then_associations(
+        self, properties: list[str], associations: list[str]
+    ):
+        """
+        Estrategia en 2 fases:
+        1. Descarga registros UNA sola vez (solo propiedades, sin asociaciones).
+        2. Para cada tipo de asociación, batch-fetch via API v4.
+        3. Merge y yield en batches de 100.
+        """
+        # Fase 1: Registros sin asociaciones
+        all_records: dict[str, dict] = {}
+        for batch in self.fetch_records_generator(properties, associations=[]):
+            for record in batch:
+                all_records[record['id']] = record
+
+        logger.info(
+            "Fase 1 completada: %d registros descargados (solo propiedades)",
+            len(all_records),
+        )
+
+        if not all_records:
+            return
+
+        # Fase 2: Asociaciones por tipo via API v4 (en paralelo)
+        object_ids = list(all_records.keys())
+        max_workers = min(self.config.max_workers, len(associations))
+
+        def _fetch_one_assoc(assoc_type_id):
+            return assoc_type_id, self.fetch_associations_batch(
+                object_ids, self.config.object_type, assoc_type_id,
+            )
+
+        logger.info(
+            "Obteniendo %d tipos de asociación con %d workers",
+            len(associations), max_workers,
+        )
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(_fetch_one_assoc, at): at
+                for at in associations
+            }
+            for future in as_completed(futures):
+                assoc_type_id = futures[future]
+                try:
+                    _, assoc_map = future.result()
+
+                    # Merge en registros usando nombre legible como key
+                    assoc_name = self.get_assoc_name(assoc_type_id)
+                    for from_id, to_list in assoc_map.items():
+                        if from_id in all_records:
+                            record = all_records[from_id]
+                            if 'associations' not in record:
+                                record['associations'] = {}
+                            if assoc_name not in record['associations']:
+                                record['associations'][assoc_name] = {'results': []}
+                            record['associations'][assoc_name]['results'].extend(to_list)
+
+                except Exception as e:
+                    logger.error(
+                        "Error obteniendo asociaciones %s -> %s: %s",
+                        self.config.object_type, assoc_type_id, e,
+                    )
+
+        # Fase 3: Yield en batches de 100
+        records_list = list(all_records.values())
+        batch_size = 100
+
+        logger.info(
+            "Registros con asociaciones combinados. Entregando %d registros.",
+            len(records_list),
+        )
+
+        for i in range(0, len(records_list), batch_size):
+            yield records_list[i:i + batch_size]
+
     def fetch_all_records_with_chunked_assocs(
         self, properties: list[str], associations: list[str]
     ):
         """
-        Descarga todos los registros manejando el límite de 30 asociaciones.
-        Si hay más de 30, hace múltiples llamadas y combina resultados.
+        Punto de entrada principal para descargar registros con asociaciones.
+        Usa la estrategia optimizada de 2 fases (fetch separado).
         """
-        chunk_size = 30
-
-        if len(associations) <= chunk_size:
-            for batch in self.fetch_records_generator(properties, associations):
+        if not associations:
+            for batch in self.fetch_records_generator(properties, associations=[]):
                 yield batch
             return
 
-        assoc_chunks = [
-            associations[i:i + chunk_size]
-            for i in range(0, len(associations), chunk_size)
-        ]
+        yield from self.fetch_records_then_associations(properties, associations)
+
+    # -----------------------------------------------------------------
+    # Search API (carga incremental)
+    # -----------------------------------------------------------------
+
+    def search_modified_records(
+        self, properties: list[str], since_timestamp: str
+    ) -> tuple[list[dict], bool]:
+        """
+        Busca registros modificados desde un timestamp usando la Search API.
+
+        POST /crm/v3/objects/{objectType}/search
+
+        Args:
+            properties: Lista de propiedades a incluir.
+            since_timestamp: Timestamp ISO para filtrar (GTE).
+
+        Returns:
+            (lista_de_registros, exceeded_limit)
+            exceeded_limit=True si hay >10000 resultados (límite de Search API).
+        """
+        url = f"{self.BASE_URL}/objects/{self.config.object_type}/search"
+
+        # Convertir ISO timestamp a milisegundos (formato que espera HubSpot)
+        from datetime import datetime, timezone
+        try:
+            dt = datetime.fromisoformat(since_timestamp.replace('+00:00', '+00:00'))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            ts_ms = str(int(dt.timestamp() * 1000))
+        except (ValueError, AttributeError):
+            ts_ms = since_timestamp
+
+        body = {
+            "filterGroups": [{
+                "filters": [{
+                    "propertyName": "hs_lastmodifieddate",
+                    "operator": "GTE",
+                    "value": ts_ms,
+                }]
+            }],
+            "properties": properties,
+            "sorts": [{"propertyName": "hs_lastmodifieddate", "direction": "ASCENDING"}],
+            "limit": 200,
+        }
+
+        all_results = []
+        after = 0
+
+        while True:
+            if after:
+                body["after"] = after
+
+            try:
+                res = self.safe_request('POST', url, json=body)
+                data = res.json()
+                total = data.get('total', 0)
+
+                if total > 10000:
+                    logger.warning(
+                        "Search API: %d resultados excede el límite de 10000. "
+                        "Se requiere full load.",
+                        total,
+                    )
+                    return [], True
+
+                results = data.get('results', [])
+                all_results.extend(results)
+
+                paging = data.get('paging')
+                if paging and 'next' in paging:
+                    after = paging['next']['after']
+                else:
+                    break
+
+            except Exception as e:
+                logger.error("Error en Search API: %s", e)
+                raise
 
         logger.info(
-            "Dividiendo %d asociaciones en %d chunks",
-            len(associations), len(assoc_chunks),
+            "Search API: %d registros modificados desde %s",
+            len(all_results), since_timestamp,
         )
-
-        all_records_dict: dict = {}
-
-        for chunk_idx, assoc_chunk in enumerate(assoc_chunks):
-            logger.info(
-                "Procesando chunk %d/%d de asociaciones (%d assocs)",
-                chunk_idx + 1, len(assoc_chunks), len(assoc_chunk),
-            )
-
-            for batch in self.fetch_records_generator(properties, assoc_chunk):
-                for record in batch:
-                    record_id = record['id']
-
-                    if record_id not in all_records_dict:
-                        all_records_dict[record_id] = record
-                    else:
-                        # Combinar asociaciones
-                        existing = all_records_dict[record_id]
-                        existing_assocs = existing.get('associations', {})
-                        new_assocs = record.get('associations', {})
-
-                        for assoc_type, assoc_data in new_assocs.items():
-                            if assoc_type not in existing_assocs:
-                                existing_assocs[assoc_type] = assoc_data
-                            else:
-                                existing_results = existing_assocs[assoc_type].get('results', [])
-                                new_results = assoc_data.get('results', [])
-                                existing_ids = {
-                                    r['id'] for r in existing_results if 'id' in r
-                                }
-                                for new_result in new_results:
-                                    if 'id' in new_result and new_result['id'] not in existing_ids:
-                                        existing_results.append(new_result)
-                                existing_assocs[assoc_type]['results'] = existing_results
-
-                        existing['associations'] = existing_assocs
-
-        # Entregar en lotes de 100
-        all_records_list = list(all_records_dict.values())
-        batch_size = 100
-
-        logger.info(
-            "Asociaciones combinadas. Entregando %d registros únicos.",
-            len(all_records_list),
-        )
-
-        for i in range(0, len(all_records_list), batch_size):
-            yield all_records_list[i:i + batch_size]
+        return all_results, False

@@ -18,6 +18,7 @@ import logging
 import re
 import sys
 import time
+from datetime import datetime, timezone
 
 logger = logging.getLogger()
 
@@ -84,55 +85,131 @@ def run_etl(config) -> dict:
     # 5. Mapeo de columnas de pipeline
     col_map = extractor.get_smart_mapping(all_props)
 
-    # 6. Proceso por lotes
+    # 5b. Determinar modo de sincronización (incremental vs full)
+    loader.initialize_metadata_table()
+    last_sync = loader.get_last_sync_timestamp()
+    sync_start_time = datetime.now(timezone.utc).isoformat()
+    sync_mode = "full"
+
     batch_count = 0
     total_records = 0
 
-    for batch in extractor.fetch_all_records_with_chunked_assocs(all_props, assocs):
-        monitor.metrics['records_fetched'] += len(batch)
-
-        # A. Transformar
-        df_batch, column_mapping = process_batch(
-            batch, col_map, prop_types, monitor, config.table_name,
-        )
-
-        if df_batch.empty:
-            continue
-
-        # B. Evolución de esquema
-        loader.sync_schema(df_batch, prop_types, column_mapping)
-
-        # C. Carga a BD
-        db_start = time.time()
+    if last_sync and not config.force_full_load:
+        logger.info("Intentando carga incremental desde %s", last_sync)
         try:
-            loader.upsert_records(df_batch)
+            modified_records, exceeded = extractor.search_modified_records(all_props, last_sync)
+
+            if not exceeded and not modified_records:
+                sync_mode = "incremental"
+                logger.info("Sin registros modificados desde la última sincronización.")
+            elif not exceeded:
+                sync_mode = "incremental"
+                logger.info(
+                    "Modo incremental: %d registros modificados encontrados",
+                    len(modified_records),
+                )
+                # Procesar registros modificados en lotes de 100
+                for i in range(0, len(modified_records), 100):
+                    batch = modified_records[i:i + 100]
+                    _process_batch_records(
+                        batch, col_map, prop_types, monitor, config,
+                        loader, extract_normalized_associations,
+                        process_batch, batch_count,
+                    )
+                    total_records += len(batch)
+                    batch_count += 1
+                    logger.info(
+                        "Lote incremental %d procesado (%d registros acumulados)",
+                        batch_count, total_records,
+                    )
+            else:
+                logger.info("Demasiados cambios (>10000). Cambiando a full load.")
         except Exception as e:
-            monitor.metrics['db_insert_errors'] += len(df_batch)
-            _log_db_error(e, batch_count)
+            logger.warning("Error en carga incremental, cambiando a full load: %s", e)
 
-        # D. Asociaciones
-        try:
-            associations_dfs = extract_normalized_associations(
-                batch, config.table_name, monitor,
+    if sync_mode == "full":
+        # 6. Proceso por lotes (full load)
+        if config.force_full_load:
+            logger.info("Full load forzado por configuración.")
+        else:
+            logger.info("Ejecutando full load.")
+
+        for batch in extractor.fetch_all_records_with_chunked_assocs(all_props, assocs):
+            monitor.metrics['records_fetched'] += len(batch)
+
+            _process_batch_records(
+                batch, col_map, prop_types, monitor, config,
+                loader, extract_normalized_associations,
+                process_batch, batch_count,
             )
-            if associations_dfs:
-                loader.load_associations(associations_dfs)
-        except Exception as e:
-            logger.error("Error en asociaciones del lote %d: %s", batch_count, e)
 
-        monitor.metrics['db_execution_time'] += (time.time() - db_start)
-        monitor.record_null_stats(df_batch)
+            total_records += len(batch)
+            batch_count += 1
+            logger.info("Lote %d procesado (%d registros acumulados)", batch_count, total_records)
 
-        total_records += len(df_batch)
-        batch_count += 1
-        logger.info("Lote %d procesado (%d registros acumulados)", batch_count, total_records)
+    # 6b. Carga de todas las asociaciones acumuladas
+    try:
+        loader.flush_associations(mode=sync_mode)
+        logger.info("Asociaciones volcadas a BD correctamente (mode=%s).", sync_mode)
+    except Exception as e:
+        logger.error("Error volcando asociaciones: %s", e)
+
+    # 6c. Actualizar metadata de sincronización
+    try:
+        loader.update_sync_metadata(sync_start_time, total_records, sync_mode)
+        logger.info("Metadata de sincronización actualizada.")
+    except Exception as e:
+        logger.error("Error actualizando metadata de sync: %s", e)
 
     # 7. Reporte
+    monitor.set_metric('sync_mode', sync_mode)
     report = monitor.generate_report()
     summary = monitor.get_summary()
+    summary['sync_mode'] = sync_mode
 
-    logger.info("ETL FINALIZADO - Objeto: %s", config.object_type)
+    logger.info("ETL FINALIZADO - Objeto: %s, Modo: %s", config.object_type, sync_mode)
     return summary
+
+
+def _process_batch_records(
+    batch, col_map, prop_types, monitor, config,
+    loader, extract_normalized_associations_fn,
+    process_batch_fn, batch_count,
+):
+    """Procesa un lote de registros: transform, schema sync, upsert, asociaciones."""
+    monitor.metrics['records_fetched'] += len(batch)
+
+    # A. Transformar
+    df_batch, column_mapping = process_batch_fn(
+        batch, col_map, prop_types, monitor, config.table_name,
+    )
+
+    if df_batch.empty:
+        return
+
+    # B. Evolución de esquema
+    loader.sync_schema(df_batch, prop_types, column_mapping)
+
+    # C. Carga a BD
+    db_start = time.time()
+    try:
+        loader.upsert_records(df_batch)
+    except Exception as e:
+        monitor.metrics['db_insert_errors'] += len(df_batch)
+        _log_db_error(e, batch_count)
+
+    # D. Asociaciones (acumular para carga al final)
+    try:
+        associations_dfs = extract_normalized_associations_fn(
+            batch, config.table_name, monitor,
+        )
+        if associations_dfs:
+            loader.accumulate_associations(associations_dfs)
+    except Exception as e:
+        logger.error("Error en asociaciones del lote %d: %s", batch_count, e)
+
+    monitor.metrics['db_execution_time'] += (time.time() - db_start)
+    monitor.record_null_stats(df_batch)
 
 
 def _log_db_error(error: Exception, batch_count: int) -> None:
@@ -284,6 +361,11 @@ Ejemplos:
         "--log-file",
         help="Ruta del archivo para guardar logs (opcional). Si se proporciona, los logs se verán en pantalla Y se guardarán en el archivo.",
     )
+    parser.add_argument(
+        "--full-load",
+        action="store_true",
+        help="Forzar carga completa (ignorar sincronización incremental).",
+    )
 
     args = parser.parse_args()
 
@@ -300,6 +382,7 @@ Ejemplos:
         config.object_type = args.object_type
         config.table_name = args.object_type
         config.log_level = args.log_level
+        config.force_full_load = args.full_load
         # Regenerar headers con token actualizado
         config.headers = {
             'Authorization': f'Bearer {config.access_token}',

@@ -30,6 +30,8 @@ class ETLConfig:
         db_pass: str,
         db_schema: str = "hubspot_etl",
         log_level: str = "INFO",
+        max_workers: int = 3,
+        force_full_load: bool = False,
     ):
         self.object_type = object_type
         self.table_name = object_type  # Convención: tabla = tipo de objeto
@@ -41,6 +43,8 @@ class ETLConfig:
         self.db_pass = db_pass
         self.db_schema = db_schema
         self.log_level = log_level.upper()
+        self.max_workers = max_workers
+        self.force_full_load = force_full_load
 
         # Headers para la API de HubSpot
         self.headers = {
@@ -65,6 +69,8 @@ class ETLConfig:
             db_pass=os.getenv("DB_PASS", ""),
             db_schema=os.getenv("DB_SCHEMA", "hubspot_etl"),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
+            max_workers=int(os.getenv("ETL_MAX_WORKERS", "3")),
+            force_full_load=os.getenv("FORCE_FULL_LOAD", "false").lower() == "true",
         )
 
     @classmethod
@@ -85,6 +91,8 @@ class ETLConfig:
             db_pass=os.getenv("DB_PASS", ""),
             db_schema=os.getenv("DB_SCHEMA", "hubspot_etl"),
             log_level=event.get("log_level", os.getenv("LOG_LEVEL", "INFO")),
+            max_workers=int(event.get("max_workers", os.getenv("ETL_MAX_WORKERS", "3"))),
+            force_full_load=event.get("force_full_load", os.getenv("FORCE_FULL_LOAD", "false").lower() == "true"),
         )
 
     # -----------------------------------------------------------------

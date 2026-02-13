@@ -19,6 +19,119 @@ python-lambda/
 └── README.md
 ```
 
+## Endpoints de HubSpot utilizados
+
+El ETL consume 6 endpoints de la API de HubSpot (v3 y v4):
+
+### 1. Propiedades del objeto
+
+```
+GET /crm/v3/properties/{objectType}
+```
+
+- **Archivo:** `etl/hubspot.py` → `get_properties_with_types()`
+- **Propósito:** Obtiene la lista completa de propiedades con sus tipos de dato (string, number, datetime, etc.)
+- **Se usa para:** Saber qué columnas crear en PostgreSQL y qué tipo de dato asignar a cada una
+- **Respuesta clave:** `results[].name`, `results[].type`
+
+### 2. Schema del objeto (asociaciones disponibles)
+
+```
+GET /crm/v3/schemas/{objectType}
+```
+
+- **Archivo:** `etl/hubspot.py` → `get_associations()`
+- **Propósito:** Obtiene el schema del objeto, incluyendo todas las asociaciones definidas
+- **Se usa para:** Saber con qué otros objetos tiene relaciones (contacts, companies, deals, custom objects, etc.)
+- **Respuesta clave:** `associations[].toObjectTypeId` (ej: `0-1` = contacts, `0-2` = companies, `2-XXXXX` = custom objects)
+
+### 3. Pipelines y stages
+
+```
+GET /crm/v3/pipelines/{objectType}
+```
+
+- **Archivo:** `etl/hubspot.py` → `get_pipelines()`
+- **Propósito:** Obtiene los pipelines del objeto con sus stages
+- **Se usa para:** Cargar tablas `{objeto}_pipelines` y `{objeto}_pipeline_stages`, y para el smart mapping de columnas de pipeline
+- **Nota:** No todos los objetos tienen pipelines. Si falla (404), se ignora silenciosamente
+
+### 4. Listado paginado de registros
+
+```
+GET /crm/v3/objects/{objectType}?limit=100&properties=...&archived=false
+```
+
+- **Archivo:** `etl/hubspot.py` → `fetch_records_generator()`
+- **Propósito:** Descarga todos los registros del objeto con sus propiedades
+- **Paginación:** Usa el campo `paging.next.after` para recorrer página por página
+- **Límites:** 100 registros por página. Si la URL supera ~8000 chars (muchas propiedades), puede fallar con 414
+- **Se usa en:** Full load (Fase 1 de la estrategia de 2 fases)
+
+### 5. Asociaciones batch v4
+
+```
+POST /crm/v4/associations/{fromObjectType}/{toObjectType}/batch/read
+Body: {"inputs": [{"id": "123"}, {"id": "456"}, ...]}
+```
+
+- **Archivo:** `etl/hubspot.py` → `fetch_associations_batch()`
+- **Propósito:** Obtiene asociaciones entre objetos en lote
+- **Límites:** Máximo 1000 IDs por request. Si hay más, se envían en chunks
+- **Respuesta:** HTTP 207 (Multi-Status) con `results[]` y `errors[]`
+- **Formato de respuesta v4:** Cada resultado contiene `from.id`, `to[].toObjectId`, `to[].associationTypes[].typeId`
+- **Se normaliza a formato v3** internamente: `{id, type, category}`
+- **Se usa en:** Full load (Fase 2 — se ejecuta en paralelo con `ThreadPoolExecutor`, 3 workers por defecto)
+
+### 6. Search API (carga incremental)
+
+```
+POST /crm/v3/objects/{objectType}/search
+Body: {
+  "filterGroups": [{"filters": [{"propertyName": "hs_lastmodifieddate", "operator": "GTE", "value": "<timestamp_ms>"}]}],
+  "properties": [...],
+  "sorts": [{"propertyName": "hs_lastmodifieddate", "direction": "ASCENDING"}],
+  "limit": 200
+}
+```
+
+- **Archivo:** `etl/hubspot.py` → `search_modified_records()`
+- **Propósito:** Busca registros modificados desde la última sincronización
+- **Límites:** Máximo 10,000 resultados totales, 200 por página
+- **Fallback:** Si `total > 10000`, retorna `exceeded_limit=True` y el ETL cambia automáticamente a full load
+- **Se usa en:** Carga incremental (cuando existe un `last_sync_timestamp` en la tabla `etl_sync_metadata`)
+
+### Flujo de llamadas API
+
+```
+Full Load:
+  GET  /properties/{type}        → obtener propiedades
+  GET  /schemas/{type}           → obtener asociaciones disponibles
+  GET  /pipelines/{type}         → obtener pipelines (opcional)
+  GET  /objects/{type}?...       → descargar todos los registros (paginado)
+  POST /v4/associations/.../batch/read  × N tipos de asociación (en paralelo)
+
+Incremental:
+  GET  /properties/{type}        → obtener propiedades
+  GET  /schemas/{type}           → obtener asociaciones disponibles
+  GET  /pipelines/{type}         → obtener pipelines (opcional)
+  POST /objects/{type}/search    → buscar registros modificados desde última sync
+```
+
+### Rate Limits
+
+El ETL maneja automáticamente los rate limits de HubSpot:
+
+| Status Code | Comportamiento |
+|-------------|----------------|
+| 200 / 207 | Respuesta exitosa |
+| 400 | Error fatal — se loguea el detalle y se aborta |
+| 414 | URL demasiado larga — demasiadas propiedades en GET |
+| 429 | Rate limit — espera 10 segundos y reintenta (máx 3 intentos) |
+| 5xx | Error de servidor — espera progresiva y reintenta (máx 3 intentos) |
+
+---
+
 ## Ejecución Local (CLI)
 
 ### Instalación
@@ -65,6 +178,7 @@ python handler.py --object-type companies --log-level DEBUG --log-file debug.log
 | `--object-type` | Sí | - | Tipo de objeto HubSpot (contacts, deals, companies, services, etc.) |
 | `--log-level` | No | INFO | Nivel de logging (DEBUG, INFO, WARNING, ERROR, CRITICAL) |
 | `--log-file` | No | - | Archivo para guardar logs. Si se proporciona, los logs se ven en pantalla Y se guardan |
+| `--full-load` | No | false | Forzar carga completa ignorando sincronización incremental |
 
 **Nota:** El parámetro `--log-file` solo funciona en modo local (CLI). En Lambda, los logs se envían automáticamente a CloudWatch.
 
@@ -128,9 +242,15 @@ Al finalizar la ejecución, el ETL retorna un resumen JSON con métricas:
   "association_tables_created": 3,
   "associations_found": 4200,
   "schema_changes": 0,
-  "columns_truncated": 0
+  "columns_truncated": 0,
+  "sync_mode": "full"
 }
 ```
+
+| Campo | Valores posibles |
+|-------|-----------------|
+| `status` | `healthy` (sin errores) / `unhealthy` (con errores parciales) |
+| `sync_mode` | `full` (carga completa) / `incremental` (solo registros modificados) |
 
 **Modo Local:** El resumen se imprime en la terminal al finalizar.
 
@@ -143,7 +263,9 @@ Al finalizar la ejecución, el ETL retorna un resumen JSON con métricas:
 ```json
 {
   "object_type": "contacts",
-  "log_level": "INFO"
+  "log_level": "INFO",
+  "max_workers": 3,
+  "force_full_load": false
 }
 ```
 
@@ -160,6 +282,8 @@ Al finalizar la ejecución, el ETL retorna un resumen JSON con métricas:
 | DB_SCHEMA | No | hubspot_etl | Schema de destino |
 | OBJECT_TYPE | No | contacts | Tipo de objeto por defecto |
 | LOG_LEVEL | No | INFO | Nivel de logging |
+| ETL_MAX_WORKERS | No | 3 | Workers paralelos para descarga de asociaciones |
+| FORCE_FULL_LOAD | No | false | Forzar carga completa (ignora incremental) |
 
 ### Respuesta Lambda
 
@@ -181,7 +305,8 @@ Al finalizar la ejecución, el ETL retorna un resumen JSON con métricas:
     "association_tables_created": 3,
     "associations_found": 4200,
     "schema_changes": 0,
-    "columns_truncated": 0
+    "columns_truncated": 0,
+    "sync_mode": "full"
   }
 }
 ```
@@ -281,7 +406,17 @@ python handler.py --object-type contacts --log-file logs/contacts.log
 python handler.py --object-type deals --log-file logs/deals.log
 python handler.py --object-type companies --log-file logs/companies.log
 python handler.py --object-type services --log-file logs/services.log
+
+# 4. Forzar carga completa (ignorar sincronización incremental)
+python handler.py --object-type contacts --full-load
 ```
+
+### Modos de sincronización
+
+- **Primera ejecución:** Siempre hace full load (no hay metadata previa)
+- **Ejecuciones posteriores:** Automáticamente usa carga incremental (Search API, solo registros modificados)
+- **Forzar full load:** Usa `--full-load` o la variable `FORCE_FULL_LOAD=true`
+- **Fallback automático:** Si hay >10,000 cambios desde la última sync, cambia a full load
 
 ### Verificar que el Archivo `.env` está configurado
 
