@@ -265,7 +265,7 @@ def transform_pipelines(pipelines: list[dict]) -> tuple:
             'created_at': pipe.get('createdAt'),
             'updated_at': pipe.get('updatedAt'),
             'archived': pipe.get('archived', False),
-            'fivetran_deleted': False,
+            'fivetran_deleted': pipe.get('archived', False),
             'fivetran_synced': synced_at,
         })
 
@@ -278,7 +278,7 @@ def transform_pipelines(pipelines: list[dict]) -> tuple:
                 'created_at': stage.get('createdAt'),
                 'updated_at': stage.get('updatedAt'),
                 'archived': stage.get('archived', False),
-                'fivetran_deleted': False,
+                'fivetran_deleted': stage.get('archived', False),
                 'fivetran_synced': synced_at,
             }
 

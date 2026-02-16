@@ -158,7 +158,21 @@ def run_etl(config) -> dict:
     except Exception as e:
         logger.error("Error volcando asociaciones: %s", e)
 
-    # 6c. Actualizar metadata de sincronización
+    # 6c. Detección de registros eliminados
+    try:
+        if sync_mode == "full":
+            deleted = loader.reconcile_deleted_records()
+            if deleted:
+                logger.info("Registros marcados como eliminados: %d", deleted)
+        elif sync_mode == "incremental":
+            archived_ids = extractor.fetch_archived_record_ids(last_sync)
+            if archived_ids:
+                marked = loader.mark_records_as_deleted(archived_ids)
+                logger.info("Registros archivados detectados: %d", marked)
+    except Exception as e:
+        logger.error("Error en detección de eliminados: %s", e)
+
+    # 6d. Actualizar metadata de sincronización
     try:
         loader.update_sync_metadata(sync_start_time, total_records, sync_mode)
         logger.info("Metadata de sincronización actualizada.")

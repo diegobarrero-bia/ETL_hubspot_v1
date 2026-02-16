@@ -32,6 +32,7 @@ class ETLMonitor:
             'pipelines_loaded': 0,
             'stages_loaded': 0,
             'association_tables_created': 0,
+            'records_deleted': 0,
         }
         self.null_stats: dict = {}
         self.association_tables: list[str] = []
@@ -97,6 +98,7 @@ class ETLMonitor:
             "associations_found": m['associations_found'],
             "schema_changes": m['schema_changes'],
             "columns_truncated": m['columns_truncated'],
+            "records_deleted": m['records_deleted'],
         }
 
     def generate_report(self) -> str:
@@ -162,6 +164,7 @@ Estado General    : {status_str}
 2. DESEMPEÑO BASE DE DATOS
 ---------------------------------------
    - Registros Upserted    : {m['db_upserts']}
+   - Registros Eliminados  : {m['records_deleted']}
    - Tiempo DB (aprox)     : {m['db_execution_time']:.2f} s
    - Errores DB            : {m['db_insert_errors']}
 

@@ -591,3 +591,83 @@ class HubSpotExtractor:
             len(all_results), since_timestamp,
         )
         return all_results, False
+
+    # -----------------------------------------------------------------
+    # Detección de archivados (incremental)
+    # -----------------------------------------------------------------
+
+    def fetch_archived_record_ids(self, since_timestamp: str) -> list[int]:
+        """
+        Obtiene IDs de registros archivados desde un timestamp.
+
+        GET /crm/v3/objects/{type}?archived=true&limit=100
+
+        Nota: Custom objects pueden no soportar archived=true.
+        En ese caso retorna lista vacía con warning.
+        """
+        from datetime import datetime, timezone
+
+        try:
+            dt = datetime.fromisoformat(since_timestamp.replace('+00:00', '+00:00'))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        except (ValueError, AttributeError):
+            dt = None
+
+        url = f"{self.BASE_URL}/objects/{self.config.object_type}"
+        archived_ids: list[int] = []
+        after = None
+
+        try:
+            while True:
+                params: dict = {"archived": "true", "limit": 100}
+                if after:
+                    params["after"] = after
+
+                res = self.safe_request('GET', url, params=params)
+                data = res.json()
+                results = data.get('results', [])
+
+                if not results:
+                    break
+
+                for record in results:
+                    archived_at_str = record.get('archivedAt')
+                    if dt and archived_at_str:
+                        try:
+                            archived_at = datetime.fromisoformat(
+                                archived_at_str.replace('Z', '+00:00')
+                            )
+                            if archived_at <= dt:
+                                continue
+                        except (ValueError, AttributeError):
+                            pass
+
+                    try:
+                        archived_ids.append(int(record['id']))
+                    except (KeyError, ValueError):
+                        continue
+
+                paging = data.get('paging')
+                if paging and paging.get('next', {}).get('after'):
+                    after = paging['next']['after']
+                else:
+                    break
+
+        except Exception as e:
+            error_msg = str(e).lower()
+            if '400' in error_msg or 'bad request' in error_msg:
+                logger.warning(
+                    "Objeto '%s' no soporta archived=true (posible custom object): %s",
+                    self.config.object_type, e,
+                )
+                return []
+            logger.warning("Error obteniendo registros archivados: %s", e)
+            return []
+
+        if archived_ids:
+            logger.info(
+                "Registros archivados detectados desde %s: %d",
+                since_timestamp, len(archived_ids),
+            )
+        return archived_ids

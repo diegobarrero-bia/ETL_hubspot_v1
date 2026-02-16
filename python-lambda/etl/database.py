@@ -23,6 +23,7 @@ class DatabaseLoader:
         self.engine: Engine = self._create_engine()
         self._accumulated_associations: dict[str, list[pd.DataFrame]] = {}
         self._column_cache: set[str] | None = None
+        self._loaded_ids: set[int] = set()
 
     def _create_engine(self) -> Engine:
         db_url = (
@@ -218,7 +219,77 @@ class DatabaseLoader:
         finally:
             raw_conn.close()
 
+        self._loaded_ids.update(df['hs_object_id'].astype(int).tolist())
         self.monitor.metrics['db_upserts'] += len(df)
+
+    # -----------------------------------------------------------------
+    # Detección de registros eliminados
+    # -----------------------------------------------------------------
+
+    def reconcile_deleted_records(self) -> int:
+        """Marca como eliminados los registros en PG que no vinieron en el full load."""
+        if not self._loaded_ids:
+            return 0
+
+        schema = self.config.db_schema
+        table = self.config.table_name
+        ids_array = list(self._loaded_ids)
+
+        sql = f"""
+            UPDATE "{schema}"."{table}"
+            SET "fivetran_deleted" = true,
+                "fivetran_synced" = NOW()
+            WHERE "hs_object_id" != ALL(%s)
+              AND ("fivetran_deleted" IS DISTINCT FROM true)
+        """
+
+        raw_conn = self.engine.raw_connection()
+        try:
+            with raw_conn.cursor() as cur:
+                cur.execute(sql, (ids_array,))
+                count = cur.rowcount
+            raw_conn.commit()
+        except Exception:
+            raw_conn.rollback()
+            raise
+        finally:
+            raw_conn.close()
+
+        if count > 0:
+            self.monitor.increment('records_deleted', count)
+        return count
+
+    def mark_records_as_deleted(self, ids: list[int]) -> int:
+        """Marca IDs específicos como eliminados (para archivados en incremental)."""
+        if not ids:
+            return 0
+
+        schema = self.config.db_schema
+        table = self.config.table_name
+
+        sql = f"""
+            UPDATE "{schema}"."{table}"
+            SET "fivetran_deleted" = true,
+                "fivetran_synced" = NOW()
+            WHERE "hs_object_id" = ANY(%s)
+              AND ("fivetran_deleted" IS DISTINCT FROM true)
+        """
+
+        raw_conn = self.engine.raw_connection()
+        try:
+            with raw_conn.cursor() as cur:
+                cur.execute(sql, (ids,))
+                count = cur.rowcount
+            raw_conn.commit()
+        except Exception:
+            raw_conn.rollback()
+            raise
+        finally:
+            raw_conn.close()
+
+        if count > 0:
+            self.monitor.increment('records_deleted', count)
+        return count
 
     # -----------------------------------------------------------------
     # Pipelines y Stages
