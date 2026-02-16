@@ -2,16 +2,15 @@
 ETL HubSpot → PostgreSQL.
 
 Entry point dual: funciona como Lambda handler y como script CLI local.
+Soporta uno o varios objetos por invocación.
 
 Lambda Event:
-    {
-        "object_type": "contacts",       # Required
-        "log_level": "INFO"              # Optional (default: INFO)
-    }
+    {"object_type": "contacts"}
+    {"object_types": ["services", "p50445259_meters", "projects"]}
 
 CLI:
     python handler.py --object-type contacts
-    python handler.py --object-type contacts --log-level DEBUG
+    python handler.py --object-type services,p50445259_meters,projects
 """
 import json
 import logging
@@ -260,28 +259,36 @@ def handler(event: dict, context=None) -> dict:
     """
     AWS Lambda handler.
 
-    Soporta invocación directa, EventBridge y test events.
+    Soporta uno o varios objetos:
+        {"object_type": "contacts"}
+        {"object_types": ["services", "p50445259_meters", "projects"]}
     """
+    import os
     from etl.config import ETLConfig
 
-    # Configurar logging para Lambda (CloudWatch)
     _setup_logging(event.get("log_level", "INFO"))
-
     logger.info("Evento recibido: %s", json.dumps(event, default=str))
 
+    # Determinar lista de objetos
+    object_types = event.get("object_types")
+    if not object_types:
+        single = event.get("object_type", os.getenv("OBJECT_TYPE", "contacts"))
+        object_types = [single]
+
+    results = []
+    errors = []
+
     try:
-        config = ETLConfig.from_lambda_event(event)
-        config.validate()
-
-        summary = run_etl(config)
-
-        status_code = 200 if summary.get("status") == "healthy" else 207
-
-        return {
-            "statusCode": status_code,
-            "headers": {"Content-Type": "application/json"},
-            "body": json.dumps(summary, default=str),
-        }
+        for obj_type in object_types:
+            obj_event = {**event, "object_type": obj_type}
+            try:
+                config = ETLConfig.from_lambda_event(obj_event)
+                config.validate()
+                summary = run_etl(config)
+                results.append(summary)
+            except Exception as e:
+                logger.error("Error procesando objeto '%s': %s", obj_type, e, exc_info=True)
+                errors.append({"object_type": obj_type, "error": type(e).__name__, "detail": str(e)})
 
     except EnvironmentError as e:
         logger.error("Error de configuración: %s", e)
@@ -291,13 +298,23 @@ def handler(event: dict, context=None) -> dict:
             "body": json.dumps({"error": "configuration_error", "detail": str(e)}),
         }
 
-    except Exception as e:
-        logger.exception("Error fatal en ETL")
+    # Respuesta
+    if len(object_types) == 1 and not errors:
+        summary = results[0]
+        status_code = 200 if summary.get("status") == "healthy" else 207
         return {
-            "statusCode": 500,
+            "statusCode": status_code,
             "headers": {"Content-Type": "application/json"},
-            "body": json.dumps({"error": type(e).__name__, "detail": str(e)}),
+            "body": json.dumps(summary, default=str),
         }
+
+    all_healthy = all(r.get("status") == "healthy" for r in results) and not errors
+    body = {"results": results, "errors": errors, "total_objects": len(object_types)}
+    return {
+        "statusCode": 200 if all_healthy else 207,
+        "headers": {"Content-Type": "application/json"},
+        "body": json.dumps(body, default=str),
+    }
 
 
 # =====================================================================
@@ -361,13 +378,13 @@ def main() -> None:
 Ejemplos:
   python handler.py --object-type contacts
   python handler.py --object-type deals --log-level DEBUG
-  python handler.py --object-type services --log-file etl_errors.log
+  python handler.py --object-type services,p50445259_meters,projects
         """,
     )
     parser.add_argument(
         "--object-type",
         required=True,
-        help="Tipo de objeto de HubSpot (contacts, deals, companies, services, etc.)",
+        help="Tipo(s) de objeto de HubSpot, separados por coma (ej: services,p50445259_meters)",
     )
     parser.add_argument(
         "--log-level",
@@ -377,7 +394,7 @@ Ejemplos:
     )
     parser.add_argument(
         "--log-file",
-        help="Ruta del archivo para guardar logs (opcional). Si se proporciona, los logs se verán en pantalla Y se guardarán en el archivo.",
+        help="Ruta del archivo para guardar logs (opcional).",
     )
     parser.add_argument(
         "--full-load",
@@ -386,54 +403,74 @@ Ejemplos:
     )
 
     args = parser.parse_args()
-
     _setup_logging(args.log_level, args.log_file)
+
+    object_types = [t.strip() for t in args.object_type.split(",") if t.strip()]
 
     print("=" * 60)
     print("  ETL HUBSPOT -> POSTGRESQL")
-    print(f"  Objeto: {args.object_type}")
+    if len(object_types) == 1:
+        print(f"  Objeto: {object_types[0]}")
+    else:
+        print(f"  Objetos: {', '.join(object_types)}")
     print("=" * 60 + "\n")
 
+    all_results = []
+    all_errors = []
+
     try:
-        config = ETLConfig.from_env()
-        # Sobrescribir object_type desde CLI
-        config.object_type = args.object_type
-        config.table_name = args.object_type
-        config.log_level = args.log_level
-        config.force_full_load = args.full_load
-        # Regenerar headers con token actualizado
-        config.headers = {
-            'Authorization': f'Bearer {config.access_token}',
-            'Content-Type': 'application/json',
-        }
-        config.validate()
+        for i, obj_type in enumerate(object_types, 1):
+            if len(object_types) > 1:
+                print(f"\n{'─' * 60}")
+                print(f"  [{i}/{len(object_types)}] Procesando: {obj_type}")
+                print(f"{'─' * 60}\n")
 
-        summary = run_etl(config)
+            try:
+                config = ETLConfig.from_env()
+                config.object_type = obj_type
+                config.log_level = args.log_level
+                config.force_full_load = args.full_load
 
-        print("\n" + "=" * 60)
-        if summary.get("status") == "healthy":
-            print("  ETL COMPLETADA EXITOSAMENTE")
-        else:
-            print("  ETL COMPLETADA CON ERRORES")
-        print("=" * 60)
-        print(json.dumps(summary, indent=2, default=str))
+                config.validate()
+                summary = run_etl(config)
+                all_results.append(summary)
 
-        sys.exit(0 if summary.get("status") == "healthy" else 1)
-
-    except EnvironmentError as e:
-        print(f"\nERROR DE CONFIGURACIÓN:\n{e}\n")
-        sys.exit(2)
+            except Exception as e:
+                logger.error("Error procesando objeto '%s': %s", obj_type, e, exc_info=True)
+                all_errors.append({"object_type": obj_type, "error": type(e).__name__, "detail": str(e)})
 
     except KeyboardInterrupt:
         print("\n\nProceso interrumpido por el usuario (Ctrl+C)")
         sys.exit(130)
 
-    except Exception as e:
-        print(f"\nERROR FATAL EN ETL:")
-        print(f"   Tipo: {type(e).__name__}")
-        print(f"   Mensaje: {str(e)}")
-        logger.critical("ETL detenido por error fatal", exc_info=True)
-        sys.exit(1)
+    # Resumen final
+    print("\n" + "=" * 60)
+    if len(object_types) > 1:
+        print(f"  RESUMEN MULTI-OBJETO ({len(object_types)} objetos)")
+        print("=" * 60)
+        for r in all_results:
+            obj = r.get("object_type", "?")
+            status = r.get("status", "?")
+            records = r.get("records_processed_ok", 0)
+            duration = r.get("duration_seconds", 0)
+            print(f"  {obj:<25} : {status:<12} ({records} registros, {duration}s)")
+        for e in all_errors:
+            print(f"  {e['object_type']:<25} : ERROR - {e['detail'][:40]}")
+    else:
+        if all_results and all_results[0].get("status") == "healthy":
+            print("  ETL COMPLETADA EXITOSAMENTE")
+        else:
+            print("  ETL COMPLETADA CON ERRORES")
+
+    print("=" * 60)
+
+    if len(all_results) == 1 and not all_errors:
+        print(json.dumps(all_results[0], indent=2, default=str))
+    else:
+        print(json.dumps({"results": all_results, "errors": all_errors}, indent=2, default=str))
+
+    all_healthy = all(r.get("status") == "healthy" for r in all_results) and not all_errors
+    sys.exit(0 if all_healthy else 1)
 
 
 if __name__ == "__main__":
