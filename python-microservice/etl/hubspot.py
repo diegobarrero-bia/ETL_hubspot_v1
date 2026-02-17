@@ -97,14 +97,29 @@ class HubSpotExtractor:
         res = self.safe_request('GET', url)
         properties_data = res.json()['results']
 
+        EXCLUDED_TYPES = {'object_coordinates'}
+
         prop_names = []
         prop_types = {}
+        excluded_count = 0
 
         for prop in properties_data:
             name = prop['name']
             hubspot_type = prop.get('type', 'string')
+
+            if hubspot_type in EXCLUDED_TYPES:
+                excluded_count += 1
+                logger.debug("Propiedad '%s' excluida (tipo: %s)", name, hubspot_type)
+                continue
+
             prop_names.append(name)
             prop_types[name] = hubspot_type
+
+        if excluded_count:
+            logger.warning(
+                "Propiedades excluidas por tipo no soportado (object_coordinates): %d de %d totales",
+                excluded_count, len(properties_data),
+            )
 
         logger.debug("Tipos capturados para %d propiedades", len(prop_types))
         return prop_names, prop_types
