@@ -298,7 +298,7 @@ class DatabaseLoader:
     def load_pipelines(
         self, df_pipelines: pd.DataFrame, df_stages: pd.DataFrame
     ) -> None:
-        """Carga pipelines y stages con estrategia TRUNCATE + INSERT."""
+        """Carga pipelines y stages con UPSERT + soft delete."""
         if df_pipelines is None or df_pipelines.empty:
             return
 
@@ -308,8 +308,8 @@ class DatabaseLoader:
         stages_table = f"{table}_pipeline_stage"
 
         try:
+            # Crear tablas si no existen (requiere SQLAlchemy conn)
             with self.engine.begin() as conn:
-                # Crear tabla de pipelines
                 conn.execute(text(f"""
                 CREATE TABLE IF NOT EXISTS {schema}.{pipeline_table} (
                     "pipeline_id" TEXT PRIMARY KEY,
@@ -322,8 +322,6 @@ class DatabaseLoader:
                     "fivetran_synced" TIMESTAMP
                 );
                 """))
-
-                # Crear tabla de stages
                 conn.execute(text(f"""
                 CREATE TABLE IF NOT EXISTS {schema}.{stages_table} (
                     "stage_id" TEXT PRIMARY KEY,
@@ -340,24 +338,51 @@ class DatabaseLoader:
                 );
                 """))
 
-                # Truncar (stages primero por FK)
-                conn.execute(text(f'TRUNCATE TABLE {schema}.{stages_table} CASCADE'))
-                conn.execute(text(f'TRUNCATE TABLE {schema}.{pipeline_table} CASCADE'))
-
-                # Insertar pipelines
-                df_pipelines.to_sql(
-                    pipeline_table, con=conn, schema=schema,
-                    if_exists='append', index=False,
-                )
-                self.monitor.set_metric('pipelines_loaded', len(df_pipelines))
-
-                # Insertar stages
-                if df_stages is not None and not df_stages.empty:
-                    df_stages.to_sql(
-                        stages_table, con=conn, schema=schema,
-                        if_exists='append', index=False,
+            # Upsert + soft delete con raw connection
+            raw_conn = self.engine.raw_connection()
+            try:
+                with raw_conn.cursor() as cur:
+                    # A. Upsert pipelines
+                    self._upsert_dataframe(
+                        cur, schema, pipeline_table,
+                        df_pipelines, pk="pipeline_id",
                     )
-                    self.monitor.set_metric('stages_loaded', len(df_stages))
+
+                    # B. Upsert stages
+                    if df_stages is not None and not df_stages.empty:
+                        self._upsert_dataframe(
+                            cur, schema, stages_table,
+                            df_stages, pk="stage_id",
+                        )
+
+                    # C. Soft delete: marcar ausentes
+                    synced_at = df_pipelines['fivetran_synced'].iloc[0]
+
+                    active_pipeline_ids = df_pipelines['pipeline_id'].tolist()
+                    self._soft_delete_missing(
+                        cur, schema, pipeline_table,
+                        "pipeline_id", active_pipeline_ids, synced_at,
+                    )
+
+                    if df_stages is not None and not df_stages.empty:
+                        active_stage_ids = df_stages['stage_id'].tolist()
+                    else:
+                        active_stage_ids = []
+                    self._soft_delete_missing(
+                        cur, schema, stages_table,
+                        "stage_id", active_stage_ids, synced_at,
+                    )
+
+                raw_conn.commit()
+            except Exception:
+                raw_conn.rollback()
+                raise
+            finally:
+                raw_conn.close()
+
+            self.monitor.set_metric('pipelines_loaded', len(df_pipelines))
+            if df_stages is not None and not df_stages.empty:
+                self.monitor.set_metric('stages_loaded', len(df_stages))
 
             logger.info(
                 "Pipelines cargados: %d pipelines, %d stages",
@@ -368,6 +393,48 @@ class DatabaseLoader:
         except Exception as e:
             logger.error("Error cargando pipelines/stages: %s", e)
             raise
+
+    def _upsert_dataframe(
+        self, cursor, schema: str, table: str,
+        df: pd.DataFrame, pk: str,
+    ) -> None:
+        """Upsert generico de un DataFrame usando ON CONFLICT."""
+        columns = df.columns.tolist()
+        cols_quoted = ', '.join(f'"{c}"' for c in columns)
+        update_cols = [c for c in columns if c != pk]
+        set_clause = ', '.join(f'"{c}" = EXCLUDED."{c}"' for c in update_cols)
+
+        sql = f"""
+            INSERT INTO "{schema}"."{table}" ({cols_quoted})
+            VALUES %s
+            ON CONFLICT ("{pk}") DO UPDATE SET {set_clause}
+        """
+
+        data = []
+        for row in df.itertuples(index=False, name=None):
+            data.append(tuple(
+                None if isinstance(v, float) and pd.isna(v) else v
+                for v in row
+            ))
+
+        execute_values(cursor, sql, data, page_size=500)
+
+    def _soft_delete_missing(
+        self, cursor, schema: str, table: str,
+        pk_col: str, active_ids: list, synced_at: str,
+    ) -> None:
+        """Marca como fivetran_deleted=TRUE los registros ausentes."""
+        if not active_ids:
+            return
+
+        placeholders = ', '.join(['%s'] * len(active_ids))
+        sql = f"""
+            UPDATE "{schema}"."{table}"
+            SET "fivetran_deleted" = TRUE, "fivetran_synced" = %s
+            WHERE "{pk_col}" NOT IN ({placeholders})
+            AND "fivetran_deleted" = FALSE
+        """
+        cursor.execute(sql, [synced_at] + active_ids)
 
     # -----------------------------------------------------------------
     # Acumulación y carga de asociaciones
