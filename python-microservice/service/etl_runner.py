@@ -128,8 +128,6 @@ def run_etl(config) -> dict:
             logger.info("Ejecutando full load.")
 
         for batch in extractor.fetch_all_records_with_chunked_assocs(all_props, assocs):
-            monitor.metrics['records_fetched'] += len(batch)
-
             _process_batch_records(
                 batch, col_map, prop_types, monitor, config,
                 loader, extract_normalized_associations,
