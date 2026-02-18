@@ -33,6 +33,35 @@ def normalize_name(text: str) -> str:
     return re.sub(r'_{2,}', '_', text).strip('_')
 
 
+def canonical_assoc_info(
+    from_name: str, to_name: str
+) -> tuple[str, str, str, bool]:
+    """
+    Naming canonico para tablas de asociaciones bidireccionales.
+    Ordena alfabeticamente los dos nombres para que ambas perspectivas
+    produzcan el mismo nombre de tabla y columnas.
+
+    Returns:
+        (table_name, col_a, col_b, swapped)
+        swapped=True si from_name quedo segundo alfabeticamente,
+        indicando que el caller debe invertir from_id/to_id.
+    """
+    if from_name == to_name:
+        return (
+            f"{from_name}_{to_name}",
+            f"from_{from_name}_id",
+            f"to_{to_name}_id",
+            False,
+        )
+    names = sorted([from_name, to_name])
+    return (
+        f"{names[0]}_{names[1]}",
+        f"{names[0]}_id",
+        f"{names[1]}_id",
+        from_name != names[0],
+    )
+
+
 def sanitize_columns_for_postgres(df: pd.DataFrame, monitor: ETLMonitor) -> pd.DataFrame:
     """
     Trunca columnas a 63 caracteres (límite PostgreSQL) y resuelve duplicados.
@@ -315,9 +344,10 @@ def extract_normalized_associations(
 ) -> dict[str, pd.DataFrame]:
     """
     Extrae asociaciones de los registros y las normaliza en DataFrames.
+    Usa naming canonico para evitar tablas duplicadas bidireccionales.
 
     Returns:
-        dict {to_object_type: DataFrame}
+        dict {canonical_table_name: DataFrame}
     """
     synced_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     associations_by_type: dict[str, list[dict]] = {}
@@ -336,38 +366,37 @@ def extract_normalized_associations(
 
             results = assoc_data.get('results', [])
 
+            canon_table, col_a, col_b, swapped = canonical_assoc_info(
+                table_name, to_object_type
+            )
+
             for assoc_item in results:
                 if 'id' not in assoc_item:
                     continue
 
-                # Self-reference detection
-                if table_name == to_object_type:
-                    from_col = f'from_{table_name}_id'
-                    to_col = f'to_{to_object_type}_id'
+                to_id = int(assoc_item['id'])
+
+                if swapped:
+                    row = {col_a: to_id, col_b: from_id}
                 else:
-                    from_col = f'{table_name}_id'
-                    to_col = f'{to_object_type}_id'
+                    row = {col_a: from_id, col_b: to_id}
 
-                row = {
-                    from_col: from_id,
-                    to_col: int(assoc_item['id']),
-                    'type_id': assoc_item.get('type'),
-                    'category': assoc_item.get('category', 'HUBSPOT_DEFINED'),
-                    'fivetran_synced': synced_at,
-                }
+                row['type_id'] = assoc_item.get('type')
+                row['category'] = assoc_item.get('category', 'HUBSPOT_DEFINED')
+                row['fivetran_synced'] = synced_at
 
-                if to_object_type not in associations_by_type:
-                    associations_by_type[to_object_type] = []
+                if canon_table not in associations_by_type:
+                    associations_by_type[canon_table] = []
 
-                associations_by_type[to_object_type].append(row)
+                associations_by_type[canon_table].append(row)
                 monitor.increment('associations_found')
 
     # Convertir a DataFrames
     dataframes: dict[str, pd.DataFrame] = {}
-    for to_type, rows in associations_by_type.items():
+    for assoc_key, rows in associations_by_type.items():
         if rows:
             df = pd.DataFrame(rows)
-            dataframes[to_type] = df
-            logger.info("Asociaciones hacia '%s': %d registros", to_type, len(df))
+            dataframes[assoc_key] = df
+            logger.info("Asociaciones '%s': %d registros", assoc_key, len(df))
 
     return dataframes

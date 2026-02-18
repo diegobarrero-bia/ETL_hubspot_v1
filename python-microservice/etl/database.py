@@ -396,24 +396,18 @@ class DatabaseLoader:
             return
 
         schema = self.config.db_schema
-        from_object = self.config.table_name
 
         try:
             with self.engine.begin() as conn:
-                for to_object_type, df_list in self._accumulated_associations.items():
+                for assoc_table, df_list in self._accumulated_associations.items():
                     df_assoc = pd.concat(df_list, ignore_index=True)
                     if df_assoc.empty:
                         continue
 
-                    assoc_table = f"{from_object}_{to_object_type}"
-
-                    # Nombres de columnas
-                    if from_object == to_object_type:
-                        from_col = f"from_{from_object}_id"
-                        to_col = f"to_{to_object_type}_id"
-                    else:
-                        from_col = f"{from_object}_id"
-                        to_col = f"{to_object_type}_id"
+                    # Extraer columnas de ID del DataFrame (ya en orden canonico)
+                    id_cols = [c for c in df_assoc.columns
+                               if c.endswith('_id') and c != 'type_id']
+                    from_col, to_col = id_cols[0], id_cols[1]
 
                     # Deduplicar por clave compuesta
                     key_cols = [from_col, to_col, "type_id"]
