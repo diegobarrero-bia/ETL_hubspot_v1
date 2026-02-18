@@ -262,7 +262,7 @@ class HubSpotExtractor:
     # Mapeo inteligente de columnas de pipelines
     # -----------------------------------------------------------------
 
-    def get_smart_mapping(self, all_props: list[str]) -> dict[str, str]:
+    def get_smart_mapping(self, all_props: list[str], pipelines: list[dict] | None = None) -> dict[str, str]:
         """
         Simplifica nombres de columnas de propiedades de pipeline/stages
         eliminando el sufijo numérico que HubSpot agrega.
@@ -271,8 +271,13 @@ class HubSpotExtractor:
           hs_v2_date_entered_600b692d_a3fe_4052_9cd7_278b134d7941_2005647967
         A:
           hs_v2_date_entered_600b692d_a3fe_4052_9cd7_278b134d7941
+
+        Args:
+            all_props: Lista de nombres de propiedades del objeto.
+            pipelines: Lista de pipelines ya obtenida. Si es None, se consulta la API.
         """
-        pipelines = self.get_pipelines()
+        if pipelines is None:
+            pipelines = self.get_pipelines()
         if not pipelines:
             return {}
 

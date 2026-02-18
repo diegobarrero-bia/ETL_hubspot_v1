@@ -76,7 +76,7 @@ def run_etl(config) -> dict:
         logger.info("Objeto '%s' no tiene pipelines disponibles.", config.object_type)
 
     # 5. Mapeo de columnas de pipeline
-    col_map = extractor.get_smart_mapping(all_props)
+    col_map = extractor.get_smart_mapping(all_props, pipelines)
 
     # 5b. Determinar modo de sincronización (incremental vs full)
     loader.initialize_metadata_table()
