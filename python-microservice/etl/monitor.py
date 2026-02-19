@@ -63,16 +63,14 @@ class ETLMonitor:
             self.truncated_columns.append(truncation)
 
     def record_null_stats(self, df) -> None:
-        """Registra estadísticas de valores nulos por columna."""
+        """Acumula conteos de nulos por columna a través de todos los lotes."""
         total_rows = len(df)
         if total_rows == 0:
             return
         null_counts = df.isnull().sum()
         for col, count in null_counts.items():
-            if count > 0:
-                pct = (count / total_rows) * 100
-                if col not in self.null_stats or pct > self.null_stats[col][1]:
-                    self.null_stats[col] = (count, pct)
+            prev_nulls, prev_rows = self.null_stats.get(col, (0, 0))
+            self.null_stats[col] = (prev_nulls + count, prev_rows + total_rows)
 
     # -----------------------------------------------------------------
     # Resumen y reporte
@@ -107,16 +105,20 @@ class ETLMonitor:
         duration_str = str(timedelta(seconds=int(duration)))
         m = self.metrics
 
-        # Sección de nulos
+        # Sección de nulos (porcentaje global sobre todos los lotes)
         nulls_report = ""
-        if self.null_stats:
+        global_nulls = {}
+        for col, (total_nulls, total_rows) in self.null_stats.items():
+            if total_nulls > 0 and total_rows > 0:
+                global_nulls[col] = (total_nulls, (total_nulls / total_rows) * 100)
+        if global_nulls:
             sorted_nulls = sorted(
-                self.null_stats.items(), key=lambda x: x[1][1], reverse=True
-            )[:10]
-            nulls_report = "\n   [Top Columnas con Valores Vacíos (Peor Lote Detectado)]\n"
+                global_nulls.items(), key=lambda x: x[1][1], reverse=True
+            )[:20]
+            nulls_report = "\n   [Top Columnas con Valores Vacíos (Global)]\n"
             for col, (count, pct) in sorted_nulls:
                 alert = "⚠️" if pct > 10 else " "
-                nulls_report += f"   - {col[:30]:<30} : ({pct:>5.1f}%) {alert}\n"
+                nulls_report += f"   - {col[:30]:<30} : {count:>6} ({pct:>5.1f}%) {alert}\n"
         else:
             nulls_report = "   - No se detectaron valores nulos significativos.\n"
 
