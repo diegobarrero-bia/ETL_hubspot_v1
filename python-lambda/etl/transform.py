@@ -252,9 +252,11 @@ def process_batch(
 
     final_mapping: dict[str, str] = {}
     for i, final_col in enumerate(df.columns):
-        original_from_before = column_name_mapping.get(df_before_sanitize.columns[i])
-        if original_from_before:
-            final_mapping[final_col] = original_from_before
+        original_from_before = column_name_mapping.get(
+            df_before_sanitize.columns[i],
+            df_before_sanitize.columns[i],
+        )
+        final_mapping[final_col] = original_from_before
 
     column_name_mapping = final_mapping
 

@@ -32,6 +32,7 @@ class ETLMonitor:
             'pipelines_loaded': 0,
             'stages_loaded': 0,
             'association_tables_created': 0,
+            'association_flush_failed': 0,
             'records_deleted': 0,
         }
         self.null_stats: dict = {}
@@ -82,7 +83,11 @@ class ETLMonitor:
         m = self.metrics
         return {
             "object_type": self.object_type,
-            "status": "healthy" if m['records_failed'] == 0 and m['db_insert_errors'] == 0 else "with_errors",
+            "status": "healthy" if (
+                m['records_failed'] == 0
+                and m['db_insert_errors'] == 0
+                and m['association_flush_failed'] == 0
+            ) else "with_errors",
             "duration_seconds": round(duration, 2),
             "records_fetched": m['records_fetched'],
             "records_processed_ok": m['records_processed_ok'],
@@ -93,6 +98,7 @@ class ETLMonitor:
             "pipelines_loaded": m['pipelines_loaded'],
             "stages_loaded": m['stages_loaded'],
             "association_tables_created": m['association_tables_created'],
+            "association_flush_failed": m['association_flush_failed'],
             "associations_found": m['associations_found'],
             "schema_changes": m['schema_changes'],
             "columns_truncated": m['columns_truncated'],
@@ -144,7 +150,11 @@ class ETLMonitor:
             if total > 10:
                 truncations_str += f"   ... y {total - 10} más (ver logs)\n"
 
-        has_errors = m['records_failed'] > 0 or m['db_insert_errors'] > 0
+        has_errors = (
+            m['records_failed'] > 0
+            or m['db_insert_errors'] > 0
+            or m['association_flush_failed'] > 0
+        )
         status_str = "CON ERRORES" if has_errors else "SALUDABLE"
 
         report = f"""
@@ -179,6 +189,7 @@ Estado General    : {status_str}
 ---------------------------------------
    - Tablas Creadas        : {m['association_tables_created']}
    - Asociaciones Totales  : {m['associations_found']}
+   - Flush Fallido         : {"SI - Metadata NO actualizada" if m['association_flush_failed'] > 0 else "No"}
 {assoc_tables_str}
 5. INTEGRIDAD & CALIDAD
 -----------------------------------------------

@@ -149,10 +149,13 @@ def run_etl(config) -> dict:
             logger.info("Lote %d procesado (%d registros acumulados)", batch_count, total_records)
 
     # 6b. Carga de todas las asociaciones acumuladas
+    associations_ok = True
     try:
         loader.flush_associations(mode=sync_mode)
         logger.info("Asociaciones volcadas a BD correctamente (mode=%s).", sync_mode)
     except Exception as e:
+        associations_ok = False
+        monitor.increment('association_flush_failed')
         logger.error("Error volcando asociaciones: %s", e)
 
     # 6c. Detección de registros eliminados
@@ -169,12 +172,18 @@ def run_etl(config) -> dict:
     except Exception as e:
         logger.error("Error en detección de eliminados: %s", e)
 
-    # 6d. Actualizar metadata de sincronización
-    try:
-        loader.update_sync_metadata(sync_start_time, total_records, sync_mode)
-        logger.info("Metadata de sincronización actualizada.")
-    except Exception as e:
-        logger.error("Error actualizando metadata de sync: %s", e)
+    # 6d. Actualizar metadata de sincronización (solo si asociaciones OK)
+    if associations_ok:
+        try:
+            loader.update_sync_metadata(sync_start_time, total_records, sync_mode)
+            logger.info("Metadata de sincronización actualizada.")
+        except Exception as e:
+            logger.error("Error actualizando metadata de sync: %s", e)
+    else:
+        logger.warning(
+            "Metadata de sync NO actualizada porque las asociaciones fallaron. "
+            "El siguiente run repetirá el proceso completo."
+        )
 
     # 7. Reporte
     monitor.set_metric('sync_mode', sync_mode)
