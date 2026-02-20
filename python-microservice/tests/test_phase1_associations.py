@@ -32,7 +32,7 @@ CANON_KEY = "companies_contacts"
 
 class TestAccumulateAssociations:
     def test_accumulate_multiple_batches_preserves_all(self, loader):
-        """3 batches con 5 registros c/u deben acumular 15 totales."""
+        """3 batches con 5 registros c/u deben acumular 15 totales (sin duplicados)."""
         batch1 = {CANON_KEY: _make_assoc_df([101, 102, 103, 104, 105], [201, 202, 203, 204, 205])}
         batch2 = {CANON_KEY: _make_assoc_df([106, 107, 108, 109, 110], [206, 207, 208, 209, 210])}
         batch3 = {CANON_KEY: _make_assoc_df([111, 112, 113, 114, 115], [211, 212, 213, 214, 215])}
@@ -42,10 +42,7 @@ class TestAccumulateAssociations:
         loader.accumulate_associations(batch3)
 
         assert CANON_KEY in loader._accumulated_associations
-        assert len(loader._accumulated_associations[CANON_KEY]) == 3
-
-        total_rows = sum(len(df) for df in loader._accumulated_associations[CANON_KEY])
-        assert total_rows == 15
+        assert len(loader._accumulated_associations[CANON_KEY]) == 15
 
     def test_accumulate_multiple_types(self, loader):
         """Asociaciones de distintos tipos se acumulan por separado."""
@@ -83,7 +80,7 @@ class TestAccumulateAssociations:
 
 class TestFlushAssociations:
     def test_flush_deduplicates_on_composite_key(self, loader):
-        """Registros duplicados por (from_id, to_id, type_id) se deduplican."""
+        """Registros duplicados por (from_id, to_id, type_id) se deduplican al acumular."""
         # Batch 1 y 2 tienen el registro (101, 201, "1") duplicado
         batch1 = {CANON_KEY: _make_assoc_df([101, 102], [201, 202])}
         batch2 = {CANON_KEY: _make_assoc_df([101, 103], [201, 203])}
@@ -91,63 +88,55 @@ class TestFlushAssociations:
         loader.accumulate_associations(batch1)
         loader.accumulate_associations(batch2)
 
-        # Concatenar y verificar la deduplicación directamente
-        all_dfs = loader._accumulated_associations[CANON_KEY]
-        combined = pd.concat(all_dfs, ignore_index=True)
-        assert len(combined) == 4  # Pre-dedup: 2 + 2 = 4
-
-        key_cols = ["companies_id", "contacts_id", "type_id"]
-        deduped = combined.drop_duplicates(subset=key_cols, keep="last")
-        assert len(deduped) == 3  # Post-dedup: (101,201), (102,202), (103,203)
+        # Dict auto-deduplica por PK: 3 registros únicos
+        assert len(loader._accumulated_associations[CANON_KEY]) == 3
 
     def test_flush_clears_accumulator(self, loader):
         """Después de flush, el acumulador debe estar vacío."""
         batch = {CANON_KEY: _make_assoc_df([101], [201])}
         loader.accumulate_associations(batch)
 
-        # Mock el engine para que no falle la escritura a BD
-        mock_conn = MagicMock()
-        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
-        mock_conn.__exit__ = MagicMock(return_value=False)
-        loader.engine.begin.return_value = mock_conn
+        mock_cursor = MagicMock()
+        mock_raw_conn = MagicMock()
+        mock_raw_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_raw_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        loader.engine.raw_connection.return_value = mock_raw_conn
 
-        # Mock to_sql en el DataFrame
-        with patch.object(pd.DataFrame, 'to_sql'):
+        with patch("etl.database.execute_values"):
             loader.flush_associations()
 
         assert loader._accumulated_associations == {}
+        assert loader._assoc_columns == {}
 
     def test_flush_empty_is_noop(self, loader):
         """Flush sin datos acumulados no hace nada."""
         loader.flush_associations()
 
-        loader.engine.begin.assert_not_called()
+        loader.engine.raw_connection.assert_not_called()
 
     def test_flush_creates_table_and_inserts(self, loader):
-        """Flush debe hacer CREATE TABLE, TRUNCATE e INSERT."""
+        """Flush debe hacer CREATE TABLE, TRUNCATE e INSERT via execute_values."""
         batch = {CANON_KEY: _make_assoc_df([101, 102], [201, 202])}
         loader.accumulate_associations(batch)
 
-        mock_conn = MagicMock()
-        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
-        mock_conn.__exit__ = MagicMock(return_value=False)
-        loader.engine.begin.return_value = mock_conn
+        mock_cursor = MagicMock()
+        mock_raw_conn = MagicMock()
+        mock_raw_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_raw_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        loader.engine.raw_connection.return_value = mock_raw_conn
 
-        with patch.object(pd.DataFrame, 'to_sql') as mock_to_sql:
+        with patch("etl.database.execute_values") as mock_ev:
             loader.flush_associations()
 
-        # Verificar que se ejecutaron SQLs (CREATE TABLE + TRUNCATE)
-        assert mock_conn.execute.call_count == 2
+        # Verificar SQLs ejecutados por el cursor
+        sql_calls = [str(c[0][0]) for c in mock_cursor.execute.call_args_list]
+        assert any("CREATE TABLE" in s for s in sql_calls)
+        assert any("TRUNCATE" in s for s in sql_calls)
 
-        sql_calls = [str(c) for c in mock_conn.execute.call_args_list]
-        sql_texts = [str(c[0][0]) for c in mock_conn.execute.call_args_list]
-
-        # Verificar CREATE TABLE
-        assert any("CREATE TABLE" in s for s in sql_texts)
-        # Verificar TRUNCATE
-        assert any("TRUNCATE" in s for s in sql_texts)
-        # Verificar to_sql fue llamado
-        mock_to_sql.assert_called_once()
+        # Verificar execute_values fue llamado con los datos
+        mock_ev.assert_called_once()
+        data = mock_ev.call_args[0][2]
+        assert len(data) == 2
 
 
 class TestCanonicalAssocInfo:

@@ -190,15 +190,16 @@ class TestFlushAssociationsMode:
         })}
         loader.accumulate_associations(batch)
 
-        mock_conn = MagicMock()
-        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
-        mock_conn.__exit__ = MagicMock(return_value=False)
-        loader.engine.begin.return_value = mock_conn
+        mock_cursor = MagicMock()
+        mock_raw_conn = MagicMock()
+        mock_raw_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_raw_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        loader.engine.raw_connection.return_value = mock_raw_conn
 
-        with patch.object(pd.DataFrame, 'to_sql'):
+        with patch("etl.database.execute_values"):
             loader.flush_associations(mode="full")
 
-        sql_calls = [str(c[0][0]) for c in mock_conn.execute.call_args_list]
+        sql_calls = [str(c[0][0]) for c in mock_cursor.execute.call_args_list]
         assert any("TRUNCATE" in s for s in sql_calls)
 
     def test_incremental_mode_no_truncate(self, loader):
@@ -213,12 +214,6 @@ class TestFlushAssociationsMode:
         })}
         loader.accumulate_associations(batch)
 
-        mock_conn = MagicMock()
-        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
-        mock_conn.__exit__ = MagicMock(return_value=False)
-        loader.engine.begin.return_value = mock_conn
-
-        # Mock raw_connection para el modo incremental
         mock_cursor = MagicMock()
         mock_raw_conn = MagicMock()
         mock_raw_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
@@ -229,6 +224,6 @@ class TestFlushAssociationsMode:
             loader.flush_associations(mode="incremental")
 
         # Verificar que CREATE TABLE se ejecutó pero NO TRUNCATE
-        sql_calls = [str(c[0][0]) for c in mock_conn.execute.call_args_list]
+        sql_calls = [str(c[0][0]) for c in mock_cursor.execute.call_args_list]
         assert any("CREATE TABLE" in s for s in sql_calls)
         assert not any("TRUNCATE" in s for s in sql_calls)

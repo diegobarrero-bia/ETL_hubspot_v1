@@ -65,8 +65,12 @@ class HubSpotExtractor:
 
                 elif res.status_code == 429:
                     self.monitor.increment('retries_429')
-                    logger.warning("Rate limit 429. Esperando 10s...")
-                    time.sleep(10)
+                    try:
+                        retry_after = min(int(res.headers.get('Retry-After', 10)), 60)
+                    except (ValueError, TypeError):
+                        retry_after = 10
+                    logger.warning("Rate limit 429. Esperando %ds...", retry_after)
+                    time.sleep(retry_after)
 
                 elif 500 <= res.status_code < 600:
                     self.monitor.increment('retries_5xx')

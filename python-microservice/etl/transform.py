@@ -247,25 +247,23 @@ def process_batch(
     column_name_mapping = updated_mapping
 
     # 4. Sanitizar para Postgres (longitud y duplicados)
-    df_before_sanitize = df.copy()
+    cols_before_sanitize = list(df.columns)
     df = sanitize_columns_for_postgres(df, monitor)
 
     final_mapping: dict[str, str] = {}
     for i, final_col in enumerate(df.columns):
-        original_from_before = column_name_mapping.get(
-            df_before_sanitize.columns[i],
-            df_before_sanitize.columns[i],
+        original = column_name_mapping.get(
+            cols_before_sanitize[i], cols_before_sanitize[i]
         )
-        final_mapping[final_col] = original_from_before
+        final_mapping[final_col] = original
 
     column_name_mapping = final_mapping
 
     # 5. Convertir dicts/lists a JSON string
-    for col in df.columns:
-        if df[col].dtype == 'object':
-            df[col] = df[col].apply(
-                lambda x: json.dumps(x) if isinstance(x, (dict, list)) else x
-            )
+    for col in df.select_dtypes(include=['object']).columns:
+        df[col] = df[col].apply(
+            lambda x: json.dumps(x) if isinstance(x, (dict, list)) else x
+        )
 
     return df, column_name_mapping
 

@@ -21,7 +21,8 @@ class DatabaseLoader:
         self.config = config
         self.monitor = monitor
         self.engine: Engine = self._create_engine()
-        self._accumulated_associations: dict[str, list[pd.DataFrame]] = {}
+        self._accumulated_associations: dict[str, dict[tuple, tuple]] = {}
+        self._assoc_columns: dict[str, list[str]] = {}
         self._column_cache: set[str] | None = None
         self._loaded_ids: set[int] = set()
 
@@ -441,16 +442,25 @@ class DatabaseLoader:
     # -----------------------------------------------------------------
 
     def accumulate_associations(self, associations_dfs: dict[str, pd.DataFrame]) -> None:
-        """Acumula DataFrames de asociaciones en memoria para carga posterior."""
+        """Acumula asociaciones como tuplas en memoria para carga posterior."""
         if not associations_dfs:
             return
 
-        for to_type, df_assoc in associations_dfs.items():
+        for table_name, df_assoc in associations_dfs.items():
             if df_assoc.empty:
                 continue
-            if to_type not in self._accumulated_associations:
-                self._accumulated_associations[to_type] = []
-            self._accumulated_associations[to_type].append(df_assoc)
+
+            # Guardar columnas y crear dict la primera vez
+            if table_name not in self._assoc_columns:
+                self._assoc_columns[table_name] = df_assoc.columns.tolist()
+                self._accumulated_associations[table_name] = {}
+
+            # Convertir a tuplas y acumular (dict auto-deduplica por PK)
+            for row in df_assoc.itertuples(index=False, name=None):
+                row_clean = tuple(None if pd.isna(v) else v for v in row)
+                # Key = (from_id, to_id, type_id) — posiciones 0, 1, 2
+                key = (row_clean[0], row_clean[1], row_clean[2])
+                self._accumulated_associations[table_name][key] = row_clean
 
     def flush_associations(self, mode: str = "full") -> None:
         """
@@ -465,85 +475,77 @@ class DatabaseLoader:
         schema = self.config.db_schema
 
         try:
-            with self.engine.begin() as conn:
-                for assoc_table, df_list in self._accumulated_associations.items():
-                    df_assoc = pd.concat(df_list, ignore_index=True)
-                    if df_assoc.empty:
-                        continue
+            raw_conn = self.engine.raw_connection()
+            try:
+                with raw_conn.cursor() as cur:
+                    for assoc_table, rows_dict in self._accumulated_associations.items():
+                        if not rows_dict:
+                            continue
 
-                    # Extraer columnas de ID del DataFrame (ya en orden canonico)
-                    id_cols = [c for c in df_assoc.columns
-                               if c.endswith('_id') and c != 'type_id']
-                    from_col, to_col = id_cols[0], id_cols[1]
+                        cols = self._assoc_columns[assoc_table]
+                        data = list(rows_dict.values())
 
-                    # Deduplicar por clave compuesta
-                    key_cols = [from_col, to_col, "type_id"]
-                    existing_key_cols = [c for c in key_cols if c in df_assoc.columns]
-                    if existing_key_cols:
-                        df_assoc = df_assoc.drop_duplicates(
-                            subset=existing_key_cols, keep="last"
-                        )
+                        # Identificar columnas de ID (ya en orden canonico)
+                        id_cols = [c for c in cols
+                                   if c.endswith('_id') and c != 'type_id']
+                        from_col, to_col = id_cols[0], id_cols[1]
+                        key_cols = [from_col, to_col, "type_id"]
 
-                    # Crear tabla
-                    conn.execute(text(f"""
-                    CREATE TABLE IF NOT EXISTS {schema}.{assoc_table} (
-                        "{from_col}" BIGINT NOT NULL,
-                        "{to_col}" BIGINT NOT NULL,
-                        "type_id" TEXT,
-                        "category" TEXT,
-                        "fivetran_synced" TIMESTAMP,
-                        PRIMARY KEY ("{from_col}", "{to_col}", "type_id")
-                    );
-                    """))
+                        # Crear tabla
+                        cur.execute(f"""
+                            CREATE TABLE IF NOT EXISTS {schema}.{assoc_table} (
+                                "{from_col}" BIGINT NOT NULL,
+                                "{to_col}" BIGINT NOT NULL,
+                                "type_id" TEXT,
+                                "category" TEXT,
+                                "fivetran_synced" TIMESTAMP,
+                                PRIMARY KEY ("{from_col}", "{to_col}", "type_id")
+                            );
+                        """)
 
-                    if mode == "full":
-                        # Full load: TRUNCATE + INSERT
-                        conn.execute(text(f'TRUNCATE TABLE {schema}.{assoc_table}'))
-                        df_assoc.to_sql(
-                            assoc_table, con=conn, schema=schema,
-                            if_exists='append', index=False,
-                        )
-                    else:
-                        # Incremental: INSERT ON CONFLICT DO UPDATE
-                        cols = df_assoc.columns.tolist()
                         cols_quoted = ', '.join(f'"{c}"' for c in cols)
-                        update_cols = [c for c in cols if c not in key_cols]
-                        set_clause = ', '.join(
-                            f'"{c}" = EXCLUDED."{c}"' for c in update_cols
-                        )
                         pk_clause = ', '.join(f'"{c}"' for c in key_cols)
 
-                        sql = f"""
-                            INSERT INTO {schema}.{assoc_table} ({cols_quoted})
-                            VALUES %s
-                            ON CONFLICT ({pk_clause}) DO UPDATE SET {set_clause}
-                        """
-                        data = [
-                            tuple(None if pd.isna(v) else v for v in row)
-                            for row in df_assoc.itertuples(index=False, name=None)
-                        ]
-                        raw_conn = self.engine.raw_connection()
-                        try:
-                            with raw_conn.cursor() as cur:
-                                execute_values(cur, sql, data, page_size=500)
-                            raw_conn.commit()
-                        except Exception:
-                            raw_conn.rollback()
-                            raise
-                        finally:
-                            raw_conn.close()
+                        if mode == "full":
+                            # Full load: TRUNCATE + INSERT
+                            cur.execute(f'TRUNCATE TABLE {schema}.{assoc_table}')
+                            sql = f"""
+                                INSERT INTO {schema}.{assoc_table} ({cols_quoted})
+                                VALUES %s
+                            """
+                        else:
+                            # Incremental: INSERT ON CONFLICT DO UPDATE
+                            update_cols = [c for c in cols if c not in key_cols]
+                            set_clause = ', '.join(
+                                f'"{c}" = EXCLUDED."{c}"' for c in update_cols
+                            )
+                            sql = f"""
+                                INSERT INTO {schema}.{assoc_table} ({cols_quoted})
+                                VALUES %s
+                                ON CONFLICT ({pk_clause}) DO UPDATE SET {set_clause}
+                            """
 
-                    self.monitor.add_association_table(assoc_table)
-                    logger.info(
-                        "Asociaciones '%s': %d registros cargados (mode=%s)",
-                        assoc_table, len(df_assoc), mode,
-                    )
+                        execute_values(cur, sql, data, page_size=500)
+
+                        self.monitor.add_association_table(assoc_table)
+                        logger.info(
+                            "Asociaciones '%s': %d registros cargados (mode=%s)",
+                            assoc_table, len(data), mode,
+                        )
+
+                raw_conn.commit()
+            except Exception:
+                raw_conn.rollback()
+                raise
+            finally:
+                raw_conn.close()
 
         except Exception as e:
             logger.error("Error cargando asociaciones: %s", e)
             raise
         finally:
             self._accumulated_associations.clear()
+            self._assoc_columns.clear()
 
     def load_associations(self, associations_dfs: dict[str, pd.DataFrame]) -> None:
         """Wrapper de compatibilidad. Usa accumulate_associations + flush_associations."""
