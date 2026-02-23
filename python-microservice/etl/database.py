@@ -21,7 +21,8 @@ class DatabaseLoader:
         self.config = config
         self.monitor = monitor
         self.engine: Engine = self._create_engine()
-        self._accumulated_associations: dict[str, list[pd.DataFrame]] = {}
+        self._accumulated_associations: dict[str, dict[tuple, tuple]] = {}
+        self._assoc_columns: dict[str, list[str]] = {}
         self._column_cache: set[str] | None = None
         self._loaded_ids: set[int] = set()
 
@@ -298,7 +299,7 @@ class DatabaseLoader:
     def load_pipelines(
         self, df_pipelines: pd.DataFrame, df_stages: pd.DataFrame
     ) -> None:
-        """Carga pipelines y stages con estrategia TRUNCATE + INSERT."""
+        """Carga pipelines y stages con UPSERT + soft delete."""
         if df_pipelines is None or df_pipelines.empty:
             return
 
@@ -308,8 +309,8 @@ class DatabaseLoader:
         stages_table = f"{table}_pipeline_stage"
 
         try:
+            # Crear tablas si no existen (requiere SQLAlchemy conn)
             with self.engine.begin() as conn:
-                # Crear tabla de pipelines
                 conn.execute(text(f"""
                 CREATE TABLE IF NOT EXISTS {schema}.{pipeline_table} (
                     "pipeline_id" TEXT PRIMARY KEY,
@@ -322,8 +323,6 @@ class DatabaseLoader:
                     "fivetran_synced" TIMESTAMP
                 );
                 """))
-
-                # Crear tabla de stages
                 conn.execute(text(f"""
                 CREATE TABLE IF NOT EXISTS {schema}.{stages_table} (
                     "stage_id" TEXT PRIMARY KEY,
@@ -340,24 +339,51 @@ class DatabaseLoader:
                 );
                 """))
 
-                # Truncar (stages primero por FK)
-                conn.execute(text(f'TRUNCATE TABLE {schema}.{stages_table} CASCADE'))
-                conn.execute(text(f'TRUNCATE TABLE {schema}.{pipeline_table} CASCADE'))
-
-                # Insertar pipelines
-                df_pipelines.to_sql(
-                    pipeline_table, con=conn, schema=schema,
-                    if_exists='append', index=False,
-                )
-                self.monitor.set_metric('pipelines_loaded', len(df_pipelines))
-
-                # Insertar stages
-                if df_stages is not None and not df_stages.empty:
-                    df_stages.to_sql(
-                        stages_table, con=conn, schema=schema,
-                        if_exists='append', index=False,
+            # Upsert + soft delete con raw connection
+            raw_conn = self.engine.raw_connection()
+            try:
+                with raw_conn.cursor() as cur:
+                    # A. Upsert pipelines
+                    self._upsert_dataframe(
+                        cur, schema, pipeline_table,
+                        df_pipelines, pk="pipeline_id",
                     )
-                    self.monitor.set_metric('stages_loaded', len(df_stages))
+
+                    # B. Upsert stages
+                    if df_stages is not None and not df_stages.empty:
+                        self._upsert_dataframe(
+                            cur, schema, stages_table,
+                            df_stages, pk="stage_id",
+                        )
+
+                    # C. Soft delete: marcar ausentes
+                    synced_at = df_pipelines['fivetran_synced'].iloc[0]
+
+                    active_pipeline_ids = df_pipelines['pipeline_id'].tolist()
+                    self._soft_delete_missing(
+                        cur, schema, pipeline_table,
+                        "pipeline_id", active_pipeline_ids, synced_at,
+                    )
+
+                    if df_stages is not None and not df_stages.empty:
+                        active_stage_ids = df_stages['stage_id'].tolist()
+                    else:
+                        active_stage_ids = []
+                    self._soft_delete_missing(
+                        cur, schema, stages_table,
+                        "stage_id", active_stage_ids, synced_at,
+                    )
+
+                raw_conn.commit()
+            except Exception:
+                raw_conn.rollback()
+                raise
+            finally:
+                raw_conn.close()
+
+            self.monitor.set_metric('pipelines_loaded', len(df_pipelines))
+            if df_stages is not None and not df_stages.empty:
+                self.monitor.set_metric('stages_loaded', len(df_stages))
 
             logger.info(
                 "Pipelines cargados: %d pipelines, %d stages",
@@ -369,21 +395,72 @@ class DatabaseLoader:
             logger.error("Error cargando pipelines/stages: %s", e)
             raise
 
+    def _upsert_dataframe(
+        self, cursor, schema: str, table: str,
+        df: pd.DataFrame, pk: str,
+    ) -> None:
+        """Upsert generico de un DataFrame usando ON CONFLICT."""
+        columns = df.columns.tolist()
+        cols_quoted = ', '.join(f'"{c}"' for c in columns)
+        update_cols = [c for c in columns if c != pk]
+        set_clause = ', '.join(f'"{c}" = EXCLUDED."{c}"' for c in update_cols)
+
+        sql = f"""
+            INSERT INTO "{schema}"."{table}" ({cols_quoted})
+            VALUES %s
+            ON CONFLICT ("{pk}") DO UPDATE SET {set_clause}
+        """
+
+        data = []
+        for row in df.itertuples(index=False, name=None):
+            data.append(tuple(
+                None if isinstance(v, float) and pd.isna(v) else v
+                for v in row
+            ))
+
+        execute_values(cursor, sql, data, page_size=500)
+
+    def _soft_delete_missing(
+        self, cursor, schema: str, table: str,
+        pk_col: str, active_ids: list, synced_at: str,
+    ) -> None:
+        """Marca como fivetran_deleted=TRUE los registros ausentes."""
+        if not active_ids:
+            return
+
+        placeholders = ', '.join(['%s'] * len(active_ids))
+        sql = f"""
+            UPDATE "{schema}"."{table}"
+            SET "fivetran_deleted" = TRUE, "fivetran_synced" = %s
+            WHERE "{pk_col}" NOT IN ({placeholders})
+            AND "fivetran_deleted" = FALSE
+        """
+        cursor.execute(sql, [synced_at] + active_ids)
+
     # -----------------------------------------------------------------
     # Acumulación y carga de asociaciones
     # -----------------------------------------------------------------
 
     def accumulate_associations(self, associations_dfs: dict[str, pd.DataFrame]) -> None:
-        """Acumula DataFrames de asociaciones en memoria para carga posterior."""
+        """Acumula asociaciones como tuplas en memoria para carga posterior."""
         if not associations_dfs:
             return
 
-        for to_type, df_assoc in associations_dfs.items():
+        for table_name, df_assoc in associations_dfs.items():
             if df_assoc.empty:
                 continue
-            if to_type not in self._accumulated_associations:
-                self._accumulated_associations[to_type] = []
-            self._accumulated_associations[to_type].append(df_assoc)
+
+            # Guardar columnas y crear dict la primera vez
+            if table_name not in self._assoc_columns:
+                self._assoc_columns[table_name] = df_assoc.columns.tolist()
+                self._accumulated_associations[table_name] = {}
+
+            # Convertir a tuplas y acumular (dict auto-deduplica por PK)
+            for row in df_assoc.itertuples(index=False, name=None):
+                row_clean = tuple(None if pd.isna(v) else v for v in row)
+                # Key = (from_id, to_id, type_id) — posiciones 0, 1, 2
+                key = (row_clean[0], row_clean[1], row_clean[2])
+                self._accumulated_associations[table_name][key] = row_clean
 
     def flush_associations(self, mode: str = "full") -> None:
         """
@@ -396,93 +473,79 @@ class DatabaseLoader:
             return
 
         schema = self.config.db_schema
-        from_object = self.config.table_name
 
         try:
-            with self.engine.begin() as conn:
-                for to_object_type, df_list in self._accumulated_associations.items():
-                    df_assoc = pd.concat(df_list, ignore_index=True)
-                    if df_assoc.empty:
-                        continue
+            raw_conn = self.engine.raw_connection()
+            try:
+                with raw_conn.cursor() as cur:
+                    for assoc_table, rows_dict in self._accumulated_associations.items():
+                        if not rows_dict:
+                            continue
 
-                    assoc_table = f"{from_object}_{to_object_type}"
+                        cols = self._assoc_columns[assoc_table]
+                        data = list(rows_dict.values())
 
-                    # Nombres de columnas
-                    if from_object == to_object_type:
-                        from_col = f"from_{from_object}_id"
-                        to_col = f"to_{to_object_type}_id"
-                    else:
-                        from_col = f"{from_object}_id"
-                        to_col = f"{to_object_type}_id"
+                        # Identificar columnas de ID (ya en orden canonico)
+                        id_cols = [c for c in cols
+                                   if c.endswith('_id') and c != 'type_id']
+                        from_col, to_col = id_cols[0], id_cols[1]
+                        key_cols = [from_col, to_col, "type_id"]
 
-                    # Deduplicar por clave compuesta
-                    key_cols = [from_col, to_col, "type_id"]
-                    existing_key_cols = [c for c in key_cols if c in df_assoc.columns]
-                    if existing_key_cols:
-                        df_assoc = df_assoc.drop_duplicates(
-                            subset=existing_key_cols, keep="last"
-                        )
+                        # Crear tabla
+                        cur.execute(f"""
+                            CREATE TABLE IF NOT EXISTS {schema}.{assoc_table} (
+                                "{from_col}" BIGINT NOT NULL,
+                                "{to_col}" BIGINT NOT NULL,
+                                "type_id" TEXT,
+                                "category" TEXT,
+                                "fivetran_synced" TIMESTAMP,
+                                PRIMARY KEY ("{from_col}", "{to_col}", "type_id")
+                            );
+                        """)
 
-                    # Crear tabla
-                    conn.execute(text(f"""
-                    CREATE TABLE IF NOT EXISTS {schema}.{assoc_table} (
-                        "{from_col}" BIGINT NOT NULL,
-                        "{to_col}" BIGINT NOT NULL,
-                        "type_id" TEXT,
-                        "category" TEXT,
-                        "fivetran_synced" TIMESTAMP,
-                        PRIMARY KEY ("{from_col}", "{to_col}", "type_id")
-                    );
-                    """))
-
-                    if mode == "full":
-                        # Full load: TRUNCATE + INSERT
-                        conn.execute(text(f'TRUNCATE TABLE {schema}.{assoc_table}'))
-                        df_assoc.to_sql(
-                            assoc_table, con=conn, schema=schema,
-                            if_exists='append', index=False,
-                        )
-                    else:
-                        # Incremental: INSERT ON CONFLICT DO UPDATE
-                        cols = df_assoc.columns.tolist()
                         cols_quoted = ', '.join(f'"{c}"' for c in cols)
-                        update_cols = [c for c in cols if c not in key_cols]
-                        set_clause = ', '.join(
-                            f'"{c}" = EXCLUDED."{c}"' for c in update_cols
-                        )
                         pk_clause = ', '.join(f'"{c}"' for c in key_cols)
 
-                        sql = f"""
-                            INSERT INTO {schema}.{assoc_table} ({cols_quoted})
-                            VALUES %s
-                            ON CONFLICT ({pk_clause}) DO UPDATE SET {set_clause}
-                        """
-                        data = [
-                            tuple(None if pd.isna(v) else v for v in row)
-                            for row in df_assoc.itertuples(index=False, name=None)
-                        ]
-                        raw_conn = self.engine.raw_connection()
-                        try:
-                            with raw_conn.cursor() as cur:
-                                execute_values(cur, sql, data, page_size=500)
-                            raw_conn.commit()
-                        except Exception:
-                            raw_conn.rollback()
-                            raise
-                        finally:
-                            raw_conn.close()
+                        if mode == "full":
+                            # Full load: TRUNCATE + INSERT
+                            cur.execute(f'TRUNCATE TABLE {schema}.{assoc_table}')
+                            sql = f"""
+                                INSERT INTO {schema}.{assoc_table} ({cols_quoted})
+                                VALUES %s
+                            """
+                        else:
+                            # Incremental: INSERT ON CONFLICT DO UPDATE
+                            update_cols = [c for c in cols if c not in key_cols]
+                            set_clause = ', '.join(
+                                f'"{c}" = EXCLUDED."{c}"' for c in update_cols
+                            )
+                            sql = f"""
+                                INSERT INTO {schema}.{assoc_table} ({cols_quoted})
+                                VALUES %s
+                                ON CONFLICT ({pk_clause}) DO UPDATE SET {set_clause}
+                            """
 
-                    self.monitor.add_association_table(assoc_table)
-                    logger.info(
-                        "Asociaciones '%s': %d registros cargados (mode=%s)",
-                        assoc_table, len(df_assoc), mode,
-                    )
+                        execute_values(cur, sql, data, page_size=500)
+
+                        self.monitor.add_association_table(assoc_table)
+                        logger.info(
+                            "Asociaciones '%s': %d registros cargados (mode=%s)",
+                            assoc_table, len(data), mode,
+                        )
+
+                raw_conn.commit()
+            except Exception:
+                raw_conn.rollback()
+                raise
+            finally:
+                raw_conn.close()
 
         except Exception as e:
             logger.error("Error cargando asociaciones: %s", e)
             raise
         finally:
             self._accumulated_associations.clear()
+            self._assoc_columns.clear()
 
     def load_associations(self, associations_dfs: dict[str, pd.DataFrame]) -> None:
         """Wrapper de compatibilidad. Usa accumulate_associations + flush_associations."""

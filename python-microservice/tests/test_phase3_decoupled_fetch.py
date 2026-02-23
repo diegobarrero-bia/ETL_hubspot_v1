@@ -216,7 +216,7 @@ class TestFetchRecordsThenAssociations:
         # extract_normalized_associations debe poder procesar el batch
         result = extract_normalized_associations(batches[0], "contacts", monitor)
 
-        assert "companies" in result
-        df = result["companies"]
+        assert "companies_contacts" in result
+        df = result["companies_contacts"]
         assert len(df) == 1
         assert df.iloc[0]["contacts_id"] == 101

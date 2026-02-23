@@ -32,6 +32,7 @@ class ETLMonitor:
             'pipelines_loaded': 0,
             'stages_loaded': 0,
             'association_tables_created': 0,
+            'association_flush_failed': 0,
             'records_deleted': 0,
         }
         self.null_stats: dict = {}
@@ -63,16 +64,14 @@ class ETLMonitor:
             self.truncated_columns.append(truncation)
 
     def record_null_stats(self, df) -> None:
-        """Registra estadísticas de valores nulos por columna."""
+        """Acumula conteos de nulos por columna a través de todos los lotes."""
         total_rows = len(df)
         if total_rows == 0:
             return
         null_counts = df.isnull().sum()
         for col, count in null_counts.items():
-            if count > 0:
-                pct = (count / total_rows) * 100
-                if col not in self.null_stats or pct > self.null_stats[col][1]:
-                    self.null_stats[col] = (count, pct)
+            prev_nulls, prev_rows = self.null_stats.get(col, (0, 0))
+            self.null_stats[col] = (prev_nulls + count, prev_rows + total_rows)
 
     # -----------------------------------------------------------------
     # Resumen y reporte
@@ -84,7 +83,11 @@ class ETLMonitor:
         m = self.metrics
         return {
             "object_type": self.object_type,
-            "status": "healthy" if m['records_failed'] == 0 and m['db_insert_errors'] == 0 else "with_errors",
+            "status": "healthy" if (
+                m['records_failed'] == 0
+                and m['db_insert_errors'] == 0
+                and m['association_flush_failed'] == 0
+            ) else "with_errors",
             "duration_seconds": round(duration, 2),
             "records_fetched": m['records_fetched'],
             "records_processed_ok": m['records_processed_ok'],
@@ -95,6 +98,7 @@ class ETLMonitor:
             "pipelines_loaded": m['pipelines_loaded'],
             "stages_loaded": m['stages_loaded'],
             "association_tables_created": m['association_tables_created'],
+            "association_flush_failed": m['association_flush_failed'],
             "associations_found": m['associations_found'],
             "schema_changes": m['schema_changes'],
             "columns_truncated": m['columns_truncated'],
@@ -107,16 +111,20 @@ class ETLMonitor:
         duration_str = str(timedelta(seconds=int(duration)))
         m = self.metrics
 
-        # Sección de nulos
+        # Sección de nulos (porcentaje global sobre todos los lotes)
         nulls_report = ""
-        if self.null_stats:
+        global_nulls = {}
+        for col, (total_nulls, total_rows) in self.null_stats.items():
+            if total_nulls > 0 and total_rows > 0:
+                global_nulls[col] = (total_nulls, (total_nulls / total_rows) * 100)
+        if global_nulls:
             sorted_nulls = sorted(
-                self.null_stats.items(), key=lambda x: x[1][1], reverse=True
-            )[:10]
-            nulls_report = "\n   [Top Columnas con Valores Vacíos (Peor Lote Detectado)]\n"
+                global_nulls.items(), key=lambda x: x[1][1], reverse=True
+            )[:20]
+            nulls_report = "\n   [Top Columnas con Valores Vacíos (Global)]\n"
             for col, (count, pct) in sorted_nulls:
                 alert = "⚠️" if pct > 10 else " "
-                nulls_report += f"   - {col[:30]:<30} : ({pct:>5.1f}%) {alert}\n"
+                nulls_report += f"   - {col[:30]:<30} : {count:>6} ({pct:>5.1f}%) {alert}\n"
         else:
             nulls_report = "   - No se detectaron valores nulos significativos.\n"
 
@@ -142,7 +150,11 @@ class ETLMonitor:
             if total > 10:
                 truncations_str += f"   ... y {total - 10} más (ver logs)\n"
 
-        has_errors = m['records_failed'] > 0 or m['db_insert_errors'] > 0
+        has_errors = (
+            m['records_failed'] > 0
+            or m['db_insert_errors'] > 0
+            or m['association_flush_failed'] > 0
+        )
         status_str = "CON ERRORES" if has_errors else "SALUDABLE"
 
         report = f"""
@@ -177,6 +189,7 @@ Estado General    : {status_str}
 ---------------------------------------
    - Tablas Creadas        : {m['association_tables_created']}
    - Asociaciones Totales  : {m['associations_found']}
+   - Flush Fallido         : {"SI - Metadata NO actualizada" if m['association_flush_failed'] > 0 else "No"}
 {assoc_tables_str}
 5. INTEGRIDAD & CALIDAD
 -----------------------------------------------

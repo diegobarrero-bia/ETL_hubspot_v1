@@ -65,7 +65,12 @@ class HubSpotExtractor:
 
                 elif res.status_code == 429:
                     self.monitor.increment('retries_429')
-                    time.sleep(10)
+                    try:
+                        retry_after = min(int(res.headers.get('Retry-After', 10)), 60)
+                    except (ValueError, TypeError):
+                        retry_after = 10
+                    logger.warning("Rate limit 429. Esperando %ds...", retry_after)
+                    time.sleep(retry_after)
 
                 elif 500 <= res.status_code < 600:
                     self.monitor.increment('retries_5xx')
@@ -97,14 +102,29 @@ class HubSpotExtractor:
         res = self.safe_request('GET', url)
         properties_data = res.json()['results']
 
+        EXCLUDED_TYPES = {'object_coordinates'}
+
         prop_names = []
         prop_types = {}
+        excluded_count = 0
 
         for prop in properties_data:
             name = prop['name']
             hubspot_type = prop.get('type', 'string')
+
+            if hubspot_type in EXCLUDED_TYPES:
+                excluded_count += 1
+                logger.debug("Propiedad '%s' excluida (tipo: %s)", name, hubspot_type)
+                continue
+
             prop_names.append(name)
             prop_types[name] = hubspot_type
+
+        if excluded_count:
+            logger.warning(
+                "Propiedades excluidas por tipo no soportado (object_coordinates): %d de %d totales",
+                excluded_count, len(properties_data),
+            )
 
         logger.debug("Tipos capturados para %d propiedades", len(prop_types))
         return prop_names, prop_types
@@ -247,7 +267,7 @@ class HubSpotExtractor:
     # Mapeo inteligente de columnas de pipelines
     # -----------------------------------------------------------------
 
-    def get_smart_mapping(self, all_props: list[str]) -> dict[str, str]:
+    def get_smart_mapping(self, all_props: list[str], pipelines: list[dict] | None = None) -> dict[str, str]:
         """
         Simplifica nombres de columnas de propiedades de pipeline/stages
         eliminando el sufijo numérico que HubSpot agrega.
@@ -256,8 +276,13 @@ class HubSpotExtractor:
           hs_v2_date_entered_600b692d_a3fe_4052_9cd7_278b134d7941_2005647967
         A:
           hs_v2_date_entered_600b692d_a3fe_4052_9cd7_278b134d7941
+
+        Args:
+            all_props: Lista de nombres de propiedades del objeto.
+            pipelines: Lista de pipelines ya obtenida. Si es None, se consulta la API.
         """
-        pipelines = self.get_pipelines()
+        if pipelines is None:
+            pipelines = self.get_pipelines()
         if not pipelines:
             return {}
 

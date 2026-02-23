@@ -1,0 +1,15 @@
+# FastAPI + Server
+fastapi>=0.109.0
+uvicorn>=0.27.0
+pydantic>=2.5.0
+
+# ETL Core
+requests>=2.31.0
+pandas>=2.1.0
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.9
+pytz>=2024.1
+python-dotenv>=1.0.0
+
+# Scheduler
+APScheduler>=3.10.0
