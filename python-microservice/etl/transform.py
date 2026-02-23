@@ -117,7 +117,7 @@ def convert_hubspot_types_to_pandas(
                 conversions_applied += 1
 
             elif hubspot_type in ('date', 'datetime'):
-                df[col] = pd.to_datetime(df[col], errors='coerce', utc=True)
+                df[col] = pd.to_datetime(df[col], errors='coerce', utc=True, format='ISO8601')
                 df[col] = df[col].dt.tz_convert(BOGOTA_TZ)
                 conversions_applied += 1
 
