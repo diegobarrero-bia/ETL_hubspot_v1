@@ -46,12 +46,33 @@ class SQSClient:
             chunk = events[i:i + 10]
             entries = []
             for event in chunk:
+                sub_type = event.get("subscriptionType", "unknown")
+                object_type = sub_type.split(".")[0] if "." in sub_type else "unknown"
+
                 entries.append({
                     "Id": str(uuid.uuid4()),
                     "MessageBody": json.dumps({
                         "event": event,
                         "received_at": received_at,
                     }),
+                    "MessageAttributes": {
+                        "eventType": {
+                            "DataType": "String",
+                            "StringValue": sub_type,
+                        },
+                        "objectType": {
+                            "DataType": "String",
+                            "StringValue": object_type,
+                        },
+                        "objectId": {
+                            "DataType": "String",
+                            "StringValue": str(event.get("objectId", "")),
+                        },
+                        "receivedAt": {
+                            "DataType": "String",
+                            "StringValue": received_at,
+                        },
+                    },
                 })
 
             response = self.client.send_message_batch(

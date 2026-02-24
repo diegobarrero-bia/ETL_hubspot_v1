@@ -95,6 +95,41 @@ class TestSendEvents:
         assert "event" in body
         assert body["event"]["objectId"] == 1
 
+    def test_message_attributes_included(self, sqs_client):
+        """Cada entry incluye MessageAttributes con eventType, objectType, objectId, receivedAt."""
+        events = [{"objectId": 42, "subscriptionType": "contact.creation"}]
+        sqs_client._mock_sqs.send_message_batch.return_value = {
+            "Successful": [{"Id": "0"}],
+            "Failed": [],
+        }
+
+        sqs_client.send_events(events)
+
+        call_kwargs = sqs_client._mock_sqs.send_message_batch.call_args
+        entry = call_kwargs.kwargs["Entries"][0]
+        attrs = entry["MessageAttributes"]
+        assert attrs["eventType"]["StringValue"] == "contact.creation"
+        assert attrs["objectType"]["StringValue"] == "contact"
+        assert attrs["objectId"]["StringValue"] == "42"
+        assert "receivedAt" in attrs
+        assert attrs["receivedAt"]["DataType"] == "String"
+
+    def test_message_attributes_defaults_for_missing_fields(self, sqs_client):
+        """Evento sin subscriptionType/objectId → defaults 'unknown' y ''."""
+        events = [{"someField": "value"}]
+        sqs_client._mock_sqs.send_message_batch.return_value = {
+            "Successful": [{"Id": "0"}],
+            "Failed": [],
+        }
+
+        sqs_client.send_events(events)
+
+        call_kwargs = sqs_client._mock_sqs.send_message_batch.call_args
+        attrs = call_kwargs.kwargs["Entries"][0]["MessageAttributes"]
+        assert attrs["eventType"]["StringValue"] == "unknown"
+        assert attrs["objectType"]["StringValue"] == "unknown"
+        assert attrs["objectId"]["StringValue"] == ""
+
     def test_reports_partial_failures(self, sqs_client):
         """Si SQS reporta failures parciales → retorna solo los exitosos."""
         events = [{"objectId": i} for i in range(3)]
