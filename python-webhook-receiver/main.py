@@ -1,6 +1,5 @@
 """FastAPI application para HubSpot Webhook Receiver."""
 import logging
-import os
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
@@ -8,13 +7,10 @@ from fastapi import FastAPI
 
 from api.webhooks import router as webhooks_router, init_dependencies, get_queue_health
 from core.config import WebhookConfig
+from core.logging_config import setup_logging
 
 load_dotenv(".env.webhook")
-
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s - %(levelname)s - [%(name)s:%(funcName)s:%(lineno)d] - %(message)s",
-)
+setup_logging("webhook-receiver")
 
 
 @asynccontextmanager

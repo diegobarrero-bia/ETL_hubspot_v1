@@ -1,6 +1,5 @@
 """Entry point para el event processor: python -m processor."""
 import logging
-import os
 import signal
 import sys
 
@@ -8,10 +7,9 @@ from dotenv import load_dotenv
 
 load_dotenv(".env.webhook")
 
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s - %(levelname)s - [%(name)s:%(funcName)s:%(lineno)d] - %(message)s",
-)
+from core.logging_config import setup_logging
+
+setup_logging("event-processor")
 
 from core.config import WebhookConfig
 from processor.worker import Worker
