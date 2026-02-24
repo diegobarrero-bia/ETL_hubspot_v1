@@ -407,9 +407,9 @@ class TestProcessAssociations:
     @patch("processor.event_handler.process_batch")
     def test_association_events_no_associations_configured(
         self, mock_transform, mock_monitor_cls, mock_extractor_cls, mock_loader_cls,
-        mock_extract_assocs, handler
+        mock_extract_assocs, handler, caplog
     ):
-        """get_associations() returns [] → method returns early, no API calls."""
+        """get_associations() returns [] → warning logged, method returns early, no API calls."""
         mock_extractor = MagicMock()
         mock_extractor_cls.return_value = mock_extractor
         mock_extractor.get_properties_with_types.return_value = (["name"], {"name": "string"})
@@ -432,3 +432,6 @@ class TestProcessAssociations:
         mock_loader.accumulate_associations.assert_not_called()
         mock_loader.flush_associations.assert_not_called()
         assert summary["processed"] == 0
+        # Warning logged for unsupported/unconfigured association type
+        assert "No associations configured" in caplog.text
+        assert "line_item" in caplog.text

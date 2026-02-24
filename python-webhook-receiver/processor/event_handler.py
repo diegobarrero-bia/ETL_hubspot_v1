@@ -103,6 +103,12 @@ class EventHandler:
         # 1. Query HubSpot schema for available associations
         associations = extractor.get_associations()
         if not associations:
+            logger.warning(
+                "No associations configured for object type '%s'. "
+                "Skipping %d association event(s). "
+                "This may indicate a custom object type (unsupported for associationChange).",
+                config.object_type, len(events),
+            )
             return
 
         # 2. Collect unique affected object IDs
