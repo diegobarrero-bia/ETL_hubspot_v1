@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from fastapi import FastAPI
 
-from api.webhooks import router as webhooks_router, init_dependencies
+from api.webhooks import router as webhooks_router, init_dependencies, get_queue_health
 from core.config import WebhookConfig
 
 load_dotenv(".env.webhook")
@@ -42,4 +42,9 @@ app.include_router(webhooks_router)
 @app.get("/health")
 def health():
     """Health check para load balancer."""
-    return {"status": "healthy", "service": "webhook-receiver"}
+    queue_reachable = get_queue_health()
+    status = "degraded" if queue_reachable is False else "healthy"
+    response = {"status": status, "service": "webhook-receiver"}
+    if queue_reachable is not None:
+        response["queue_reachable"] = queue_reachable
+    return response

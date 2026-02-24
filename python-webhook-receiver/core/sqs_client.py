@@ -18,6 +18,17 @@ class SQSClient:
         endpoint_url = "http://localhost:4566" if "localhost" in queue_url else None
         self.client = boto3.client("sqs", region_name=region, endpoint_url=endpoint_url)
 
+    def check_health(self) -> bool:
+        """Verifica conectividad con la cola SQS."""
+        try:
+            self.client.get_queue_attributes(
+                QueueUrl=self.queue_url,
+                AttributeNames=["ApproximateNumberOfMessages"],
+            )
+            return True
+        except Exception:
+            return False
+
     def send_events(self, events: list[dict]) -> int:
         """
         Envía eventos webhook a SQS en batches de máx. 10.

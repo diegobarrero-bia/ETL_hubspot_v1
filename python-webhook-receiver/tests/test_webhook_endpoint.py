@@ -35,6 +35,7 @@ def client(webhook_config):
     with patch("api.webhooks.SQSClient") as MockSQSClient:
         mock_sqs = MagicMock()
         mock_sqs.send_events.return_value = 2
+        mock_sqs.check_health.return_value = True
         MockSQSClient.return_value = mock_sqs
 
         init_dependencies(webhook_config)
@@ -132,11 +133,41 @@ class TestWebhookEndpoint:
 class TestHealthEndpoint:
     """Tests para GET /health."""
 
-    def test_health_endpoint_returns_200(self, client):
-        """GET /health → 200 con status healthy."""
+    def test_health_returns_queue_reachable_true(self, client):
+        """SQS accesible → status healthy + queue_reachable true."""
+        client._mock_sqs.check_health.return_value = True
         response = client.get("/health")
 
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "healthy"
         assert data["service"] == "webhook-receiver"
+        assert data["queue_reachable"] is True
+
+    def test_health_returns_degraded_when_queue_unreachable(self, client):
+        """SQS inaccesible → status degraded + queue_reachable false."""
+        client._mock_sqs.check_health.return_value = False
+        response = client.get("/health")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "degraded"
+        assert data["queue_reachable"] is False
+
+    def test_health_returns_healthy_when_sqs_not_initialized(self, webhook_config):
+        """Sin SQS client → status healthy, sin queue_reachable."""
+        import api.webhooks as webhooks_module
+        from main import app
+
+        original_client = webhooks_module._sqs_client
+        webhooks_module._sqs_client = None
+        try:
+            test_client = TestClient(app)
+            response = test_client.get("/health")
+
+            assert response.status_code == 200
+            data = response.json()
+            assert data["status"] == "healthy"
+            assert "queue_reachable" not in data
+        finally:
+            webhooks_module._sqs_client = original_client

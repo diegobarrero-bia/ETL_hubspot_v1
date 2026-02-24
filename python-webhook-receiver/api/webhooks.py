@@ -24,6 +24,13 @@ def init_dependencies(config: WebhookConfig):
     _sqs_client = SQSClient(config.sqs_queue_url, config.sqs_region)
 
 
+def get_queue_health() -> bool | None:
+    """Retorna estado de conectividad SQS, o None si el cliente no está inicializado."""
+    if _sqs_client is None:
+        return None
+    return _sqs_client.check_health()
+
+
 @router.post("/webhooks/hubspot")
 async def receive_hubspot_webhook(request: Request):
     """

@@ -106,3 +106,25 @@ class TestSendEvents:
         sent = sqs_client.send_events(events)
 
         assert sent == 2
+
+
+class TestCheckHealth:
+    """Verifica check_health() de SQSClient."""
+
+    def test_check_health_returns_true_when_queue_accessible(self, sqs_client):
+        """get_queue_attributes exitoso → True."""
+        sqs_client._mock_sqs.get_queue_attributes.return_value = {
+            "Attributes": {"ApproximateNumberOfMessages": "5"}
+        }
+
+        assert sqs_client.check_health() is True
+        sqs_client._mock_sqs.get_queue_attributes.assert_called_once_with(
+            QueueUrl=QUEUE_URL,
+            AttributeNames=["ApproximateNumberOfMessages"],
+        )
+
+    def test_check_health_returns_false_when_queue_unreachable(self, sqs_client):
+        """get_queue_attributes falla → False."""
+        sqs_client._mock_sqs.get_queue_attributes.side_effect = Exception("Connection refused")
+
+        assert sqs_client.check_health() is False
