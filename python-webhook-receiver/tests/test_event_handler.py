@@ -347,3 +347,88 @@ class TestSmartMapping:
         # Solo 1 llamada a cada uno, no 2 (una por updates + una por deletions)
         mock_extractor.get_properties_with_types.assert_called_once()
         mock_extractor.get_smart_mapping.assert_called_once_with(["email"])
+
+
+class TestProcessAssociations:
+    """Verifica procesamiento de eventos de asociación."""
+
+    @patch("processor.event_handler.extract_normalized_associations")
+    @patch("processor.event_handler.DatabaseLoader")
+    @patch("processor.event_handler.HubSpotExtractor")
+    @patch("processor.event_handler.ETLMonitor")
+    @patch("processor.event_handler.process_batch")
+    def test_association_events_full_flow(
+        self, mock_transform, mock_monitor_cls, mock_extractor_cls, mock_loader_cls,
+        mock_extract_assocs, handler
+    ):
+        """Association events → get_associations → batch read → extract → accumulate → flush."""
+        mock_extractor = MagicMock()
+        mock_extractor_cls.return_value = mock_extractor
+        mock_extractor.get_properties_with_types.return_value = (["email"], {"email": "string"})
+        mock_extractor.get_smart_mapping.return_value = {}
+        mock_extractor.get_associations.return_value = ["2", "3"]
+        mock_extractor.BASE_URL = "https://api.hubapi.com/crm/v3"
+        mock_extractor.safe_request.return_value = MagicMock(
+            json=lambda: {"results": [
+                {"id": "10", "properties": {"email": "a@test.com"}, "associations": {}},
+            ]},
+        )
+
+        mock_loader = MagicMock()
+        mock_loader_cls.return_value = mock_loader
+
+        df = pd.DataFrame({"hs_object_id": [10], "email": ["a"]})
+        mock_transform.return_value = (df, {"email": "email"})
+
+        mock_extract_assocs.return_value = {"contacts_to_companies": MagicMock()}
+
+        events = [_make_event("contact", 10, "associationChange")]
+        batch = EventBatch(events=events)
+
+        summary = handler.process_batch(batch)
+
+        # Verify get_associations was called
+        mock_extractor.get_associations.assert_called_once()
+        # Verify batch read included associations
+        call_args = mock_extractor.safe_request.call_args
+        body_sent = call_args[1]["json"]
+        assert "associations" in body_sent
+        assert body_sent["associations"] == ["2", "3"]
+        # Verify extract → accumulate → flush pattern
+        mock_extract_assocs.assert_called_once()
+        mock_loader.accumulate_associations.assert_called_once()
+        mock_loader.flush_associations.assert_called_once_with(mode="incremental")
+        assert summary["processed"] == 1
+
+    @patch("processor.event_handler.extract_normalized_associations")
+    @patch("processor.event_handler.DatabaseLoader")
+    @patch("processor.event_handler.HubSpotExtractor")
+    @patch("processor.event_handler.ETLMonitor")
+    @patch("processor.event_handler.process_batch")
+    def test_association_events_no_associations_configured(
+        self, mock_transform, mock_monitor_cls, mock_extractor_cls, mock_loader_cls,
+        mock_extract_assocs, handler
+    ):
+        """get_associations() returns [] → method returns early, no API calls."""
+        mock_extractor = MagicMock()
+        mock_extractor_cls.return_value = mock_extractor
+        mock_extractor.get_properties_with_types.return_value = (["name"], {"name": "string"})
+        mock_extractor.get_smart_mapping.return_value = {}
+        mock_extractor.get_associations.return_value = []
+
+        mock_loader = MagicMock()
+        mock_loader_cls.return_value = mock_loader
+
+        events = [_make_event("line_item", 50, "associationChange")]
+        batch = EventBatch(events=events)
+
+        summary = handler.process_batch(batch)
+
+        # get_associations was called
+        mock_extractor.get_associations.assert_called_once()
+        # But no batch read, no transform, no flush
+        mock_extractor.safe_request.assert_not_called()
+        mock_extract_assocs.assert_not_called()
+        mock_loader.accumulate_associations.assert_not_called()
+        mock_loader.flush_associations.assert_not_called()
+        assert summary["processed"] == 0

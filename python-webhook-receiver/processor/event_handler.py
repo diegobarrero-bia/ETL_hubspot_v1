@@ -4,7 +4,7 @@ import logging
 from etl.database import DatabaseLoader
 from etl.hubspot import HubSpotExtractor
 from etl.monitor import ETLMonitor
-from etl.transform import process_batch
+from etl.transform import process_batch, extract_normalized_associations
 
 from core.config import WebhookConfig
 from processor.batcher import EventBatch
@@ -97,11 +97,15 @@ class EventHandler:
         """
         Procesa cambios de asociación re-sincronizando los registros afectados.
 
-        Cuando una asociación cambia entre A y B, re-fetch ambos registros
+        Cuando una asociación cambia entre A y B, re-fetch los registros
         con sus asociaciones actualizadas desde HubSpot.
         """
-        # Recolectar IDs únicos de objetos afectados (from_object_id)
-        # objectId es el "from" en association events
+        # 1. Query HubSpot schema for available associations
+        associations = extractor.get_associations()
+        if not associations:
+            return
+
+        # 2. Collect unique affected object IDs
         affected_ids = set()
         for event in events:
             if event.object_id:
@@ -116,32 +120,30 @@ class EventHandler:
             len(events), len(affected_ids), config.object_type,
         )
 
-        # Re-fetch los registros afectados (con asociaciones actualizadas)
+        # 3. Re-fetch records WITH associations from HubSpot
         url = f"{extractor.BASE_URL}/objects/{config.object_type}/batch/read"
-
-        # Incluir associations en el fetch
-        associations_param = ",".join(config.associations) if config.associations else None
         body = {
             "inputs": [{"id": str(oid)} for oid in affected_ids],
             "properties": properties,
+            "associations": associations,
         }
-        if associations_param:
-            body["associations"] = associations_param.split(",")
-
         response = extractor.safe_request("POST", url, json=body)
         records = response.json()["results"]
 
-        # Transform y upsert
+        # 4. Transform and upsert the records themselves
         df, column_mapping = process_batch(
             records, col_map, prop_types, monitor, config.table_name,
         )
-
         loader.sync_schema(df, prop_types, column_mapping)
         loader.upsert_records(df)
 
-        # Re-sync associations para estos registros
-        if config.associations:
-            loader.flush_associations(df, records)
+        # 5. Extract and flush associations using the standard ETL pattern
+        associations_dfs = extract_normalized_associations(
+            records, config.table_name, monitor,
+        )
+        if associations_dfs:
+            loader.accumulate_associations(associations_dfs)
+            loader.flush_associations(mode="incremental")
 
         summary["processed"] += len(df)
         logger.info(
