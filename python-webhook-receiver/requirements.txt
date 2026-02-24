@@ -1,0 +1,19 @@
+# FastAPI + Server (webhook receiver)
+fastapi>=0.109.0
+uvicorn>=0.27.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+
+# AWS
+boto3>=1.34.0
+
+# ETL Core (shared via Docker volume mount from python-microservice/etl/)
+requests>=2.31.0
+pandas>=2.1.0
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.9
+pytz>=2024.1
+python-dotenv>=1.0.0
+
+# Testing
+pytest>=7.4.0
