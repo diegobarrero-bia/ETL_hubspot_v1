@@ -83,12 +83,13 @@ class EventBatch:
         return dict(groups)
 
     def deduplicate(self) -> "EventBatch":
-        """Mantiene solo el evento más reciente por object_id."""
-        latest: dict[int, WebhookEvent] = {}
+        """Mantiene solo el evento más reciente por (object_type, object_id)."""
+        latest: dict[tuple[str, int], WebhookEvent] = {}
         for event in self.events:
-            existing = latest.get(event.object_id)
+            key = (event.object_type, event.object_id)
+            existing = latest.get(key)
             if existing is None or event.occurred_at > existing.occurred_at:
-                latest[event.object_id] = event
+                latest[key] = event
         return EventBatch(events=list(latest.values()))
 
 

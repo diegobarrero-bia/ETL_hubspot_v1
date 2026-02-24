@@ -145,6 +145,27 @@ class TestEventBatch:
         assert event_51.occurred_at == 2000
         assert event_51.property_value == "nuevo"
 
+    def test_deduplicate_preserves_different_object_types_same_id(self):
+        """contact 123 and deal 123 must both survive deduplication."""
+        events = [
+            WebhookEvent.from_hubspot_payload({
+                "subscriptionType": "contact.propertyChange",
+                "objectId": 123,
+                "occurredAt": 1000,
+            }),
+            WebhookEvent.from_hubspot_payload({
+                "subscriptionType": "deal.propertyChange",
+                "objectId": 123,
+                "occurredAt": 2000,
+            }),
+        ]
+        batch = EventBatch(events=events)
+        deduped = batch.deduplicate()
+
+        assert len(deduped.events) == 2
+        types = {e.object_type for e in deduped.events}
+        assert types == {"contact", "deal"}
+
     def test_empty_batch_operations(self):
         """Batch vacío no causa errores."""
         batch = EventBatch(events=[])
