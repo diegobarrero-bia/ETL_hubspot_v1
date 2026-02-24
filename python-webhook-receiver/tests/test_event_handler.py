@@ -38,6 +38,7 @@ class TestProcessUpdates:
         mock_extractor = MagicMock()
         mock_extractor_cls.return_value = mock_extractor
         mock_extractor.get_properties_with_types.return_value = (["email", "name"], {"email": "string"})
+        mock_extractor.get_smart_mapping.return_value = {}
         mock_extractor.safe_request.return_value = MagicMock(
             status_code=200,
             json=lambda: {"results": [
@@ -61,6 +62,7 @@ class TestProcessUpdates:
         summary = handler.process_batch(batch)
 
         # Verify
+        mock_extractor.get_smart_mapping.assert_called_once_with(["email", "name"])
         mock_loader.upsert_records.assert_called_once()
         assert summary["processed"] == 3
 
@@ -72,6 +74,11 @@ class TestProcessUpdates:
         self, mock_transform, mock_monitor_cls, mock_extractor_cls, mock_loader_cls, handler
     ):
         """2 deletion events → mark_records_as_deleted([id1, id2])."""
+        mock_extractor = MagicMock()
+        mock_extractor_cls.return_value = mock_extractor
+        mock_extractor.get_properties_with_types.return_value = ([], {})
+        mock_extractor.get_smart_mapping.return_value = {}
+
         mock_loader = MagicMock()
         mock_loader.mark_records_as_deleted.return_value = 2
         mock_loader_cls.return_value = mock_loader
@@ -98,6 +105,7 @@ class TestProcessUpdates:
         mock_extractor = MagicMock()
         mock_extractor_cls.return_value = mock_extractor
         mock_extractor.get_properties_with_types.return_value = (["email"], {"email": "string"})
+        mock_extractor.get_smart_mapping.return_value = {}
         mock_extractor.safe_request.return_value = MagicMock(
             status_code=200,
             json=lambda: {"results": [
@@ -142,6 +150,7 @@ class TestMultipleObjectTypes:
         mock_extractor = MagicMock()
         mock_extractor_cls.return_value = mock_extractor
         mock_extractor.get_properties_with_types.return_value = (["name"], {"name": "string"})
+        mock_extractor.get_smart_mapping.return_value = {}
         mock_extractor.safe_request.return_value = MagicMock(
             status_code=200,
             json=lambda: {"results": [{"id": "1", "properties": {"name": "test"}}]},
@@ -183,6 +192,7 @@ class TestErrorHandling:
             call_count[0] += 1
             extractor = MagicMock()
             extractor.get_properties_with_types.return_value = (["name"], {"name": "string"})
+            extractor.get_smart_mapping.return_value = {}
             if call_count[0] == 1:
                 # Primera llamada (contacts) falla
                 extractor.safe_request.side_effect = Exception("API error")
@@ -214,3 +224,126 @@ class TestErrorHandling:
         assert summary["errors"] > 0
         # Al menos deals debería estar en processed (1) o los contacts en errors (1)
         assert summary["errors"] + summary["processed"] + summary["deleted"] > 0
+
+
+class TestSmartMapping:
+    """Verifica integración de get_smart_mapping()."""
+
+    @patch("processor.event_handler.DatabaseLoader")
+    @patch("processor.event_handler.HubSpotExtractor")
+    @patch("processor.event_handler.ETLMonitor")
+    @patch("processor.event_handler.process_batch")
+    def test_smart_mapping_passed_to_process_batch(
+        self, mock_transform, mock_monitor_cls, mock_extractor_cls, mock_loader_cls, handler
+    ):
+        """Pipeline col_map from get_smart_mapping() es pasado a process_batch."""
+        mock_extractor = MagicMock()
+        mock_extractor_cls.return_value = mock_extractor
+        mock_extractor.get_properties_with_types.return_value = (
+            ["email", "hs_v2_date_entered_abc123_999"],
+            {"email": "string", "hs_v2_date_entered_abc123_999": "datetime"},
+        )
+        # Simular smart mapping que renombra columna de pipeline
+        smart_map = {"hs_v2_date_entered_abc123_999": "hs_v2_date_entered_abc123"}
+        mock_extractor.get_smart_mapping.return_value = smart_map
+
+        mock_extractor.safe_request.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {"results": [
+                {"id": "1", "properties": {"email": "a@test.com", "hs_v2_date_entered_abc123_999": "2024-01-01"}},
+            ]},
+        )
+
+        mock_loader = MagicMock()
+        mock_loader_cls.return_value = mock_loader
+
+        df = pd.DataFrame({"hs_object_id": [1], "email": ["a"], "hs_v2_date_entered_abc123": ["2024-01-01"]})
+        mock_transform.return_value = (df, {"email": "email", "hs_v2_date_entered_abc123": "hs_v2_date_entered_abc123_999"})
+
+        events = [_make_event("deal", 1, "propertyChange")]
+        batch = EventBatch(events=events)
+
+        handler.process_batch(batch)
+
+        # Verificar que process_batch recibió el smart_map (no un identity map)
+        mock_transform.assert_called_once()
+        call_args = mock_transform.call_args
+        col_map_arg = call_args[0][1]  # segundo argumento posicional
+        assert col_map_arg == smart_map
+
+    @patch("processor.event_handler.DatabaseLoader")
+    @patch("processor.event_handler.HubSpotExtractor")
+    @patch("processor.event_handler.ETLMonitor")
+    @patch("processor.event_handler.process_batch")
+    def test_no_pipelines_returns_empty_mapping(
+        self, mock_transform, mock_monitor_cls, mock_extractor_cls, mock_loader_cls, handler
+    ):
+        """Sin pipelines → col_map vacío (no identity map)."""
+        mock_extractor = MagicMock()
+        mock_extractor_cls.return_value = mock_extractor
+        mock_extractor.get_properties_with_types.return_value = (["email"], {"email": "string"})
+        mock_extractor.get_smart_mapping.return_value = {}  # No pipelines
+
+        mock_extractor.safe_request.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {"results": [
+                {"id": "1", "properties": {"email": "a@test.com"}},
+            ]},
+        )
+
+        mock_loader = MagicMock()
+        mock_loader_cls.return_value = mock_loader
+
+        df = pd.DataFrame({"hs_object_id": [1], "email": ["a"]})
+        mock_transform.return_value = (df, {"email": "email"})
+
+        events = [_make_event("contact", 1, "creation")]
+        batch = EventBatch(events=events)
+
+        handler.process_batch(batch)
+
+        # col_map debe ser {} (vacío), no identity
+        call_args = mock_transform.call_args
+        col_map_arg = call_args[0][1]
+        assert col_map_arg == {}
+
+    @patch("processor.event_handler.DatabaseLoader")
+    @patch("processor.event_handler.HubSpotExtractor")
+    @patch("processor.event_handler.ETLMonitor")
+    @patch("processor.event_handler.process_batch")
+    def test_properties_fetched_once_per_object_type(
+        self, mock_transform, mock_monitor_cls, mock_extractor_cls, mock_loader_cls, handler
+    ):
+        """get_properties_with_types y get_smart_mapping se llaman 1 vez (no por sub-método)."""
+        mock_extractor = MagicMock()
+        mock_extractor_cls.return_value = mock_extractor
+        mock_extractor.get_properties_with_types.return_value = (["email"], {"email": "string"})
+        mock_extractor.get_smart_mapping.return_value = {}
+
+        mock_extractor.safe_request.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {"results": [
+                {"id": "1", "properties": {"email": "a@test.com"}},
+            ]},
+        )
+
+        mock_loader = MagicMock()
+        mock_loader_cls.return_value = mock_loader
+
+        df = pd.DataFrame({"hs_object_id": [1], "email": ["a"]})
+        mock_transform.return_value = (df, {"email": "email"})
+
+        # Batch con updates y deletions del mismo tipo
+        events = [
+            _make_event("contact", 1, "creation"),
+            _make_event("contact", 2, "propertyChange"),
+            _make_event("contact", 99, "deletion"),
+        ]
+        batch = EventBatch(events=events)
+
+        mock_loader.mark_records_as_deleted.return_value = 1
+        handler.process_batch(batch)
+
+        # Solo 1 llamada a cada uno, no 2 (una por updates + una por deletions)
+        mock_extractor.get_properties_with_types.assert_called_once()
+        mock_extractor.get_smart_mapping.assert_called_once_with(["email"])

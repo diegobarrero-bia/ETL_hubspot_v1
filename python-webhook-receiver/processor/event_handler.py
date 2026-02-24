@@ -53,19 +53,22 @@ class EventHandler:
         deletions = [e for e in events if e.change_type == "deletion"]
         associations = [e for e in events if e.change_type == "association"]
 
+        # Obtener propiedades y smart mapping una sola vez por object_type
+        properties, prop_types = extractor.get_properties_with_types()
+        col_map = extractor.get_smart_mapping(properties)
+
         if updates:
-            self._process_updates(extractor, loader, monitor, etl_config, updates, summary)
+            self._process_updates(extractor, loader, monitor, etl_config, updates, summary, properties, prop_types, col_map)
 
         if deletions:
             self._process_deletions(loader, deletions, summary)
 
         if associations:
-            self._process_associations(extractor, loader, monitor, etl_config, associations, summary)
+            self._process_associations(extractor, loader, monitor, etl_config, associations, summary, properties, prop_types, col_map)
 
-    def _process_updates(self, extractor, loader, monitor, config, events, summary) -> None:
+    def _process_updates(self, extractor, loader, monitor, config, events, summary,
+                         properties, prop_types, col_map) -> None:
         """Fetch, transform, y upsert records actualizados/creados."""
-        properties, prop_types = extractor.get_properties_with_types()
-
         object_ids = [e.object_id for e in events]
         url = f"{extractor.BASE_URL}/objects/{config.object_type}/batch/read"
         body = {
@@ -75,7 +78,6 @@ class EventHandler:
         response = extractor.safe_request("POST", url, json=body)
         records = response.json()["results"]
 
-        col_map = {prop: prop for prop in properties}
         df, column_mapping = process_batch(
             records, col_map, prop_types, monitor, config.table_name,
         )
@@ -90,7 +92,8 @@ class EventHandler:
         deleted = loader.mark_records_as_deleted(ids)
         summary["deleted"] += deleted
 
-    def _process_associations(self, extractor, loader, monitor, config, events, summary) -> None:
+    def _process_associations(self, extractor, loader, monitor, config, events, summary,
+                              properties, prop_types, col_map) -> None:
         """
         Procesa cambios de asociación re-sincronizando los registros afectados.
 
@@ -114,7 +117,6 @@ class EventHandler:
         )
 
         # Re-fetch los registros afectados (con asociaciones actualizadas)
-        properties, prop_types = extractor.get_properties_with_types()
         url = f"{extractor.BASE_URL}/objects/{config.object_type}/batch/read"
 
         # Incluir associations en el fetch
@@ -130,7 +132,6 @@ class EventHandler:
         records = response.json()["results"]
 
         # Transform y upsert
-        col_map = {prop: prop for prop in properties}
         df, column_mapping = process_batch(
             records, col_map, prop_types, monitor, config.table_name,
         )
