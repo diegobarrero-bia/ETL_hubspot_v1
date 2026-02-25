@@ -74,7 +74,26 @@ class TestWebhookConfigETLBridge:
 
     def test_builds_etl_config_for_different_object_types(self, webhook_config):
         """build_etl_config() funciona para distintos tipos de objetos."""
-        for obj_type in ["contacts", "deals", "companies", "tickets", "services"]:
+        # Unmapped types pass through as-is
+        for obj_type in ["contact", "deal", "companies", "tickets"]:
             etl_config = webhook_config.build_etl_config(obj_type)
             assert etl_config.object_type == obj_type
             assert etl_config.table_name == obj_type
+
+    def test_resolve_table_name_mapping(self, webhook_config):
+        """resolve_table_name() maps API object types to DB table names."""
+        assert webhook_config.resolve_table_name("services") == "service"
+        assert webhook_config.resolve_table_name("projects") == "project"
+        # Unmapped types pass through
+        assert webhook_config.resolve_table_name("contact") == "contact"
+        assert webhook_config.resolve_table_name("deal") == "deal"
+
+    def test_build_etl_config_keeps_api_name_maps_table(self, webhook_config):
+        """build_etl_config() keeps object_type for API, overrides table_name."""
+        etl_config = webhook_config.build_etl_config("services")
+        assert etl_config.object_type == "services"   # API name (unchanged)
+        assert etl_config.table_name == "service"      # DB table (mapped)
+
+        etl_config = webhook_config.build_etl_config("projects")
+        assert etl_config.object_type == "projects"    # API name (unchanged)
+        assert etl_config.table_name == "project"      # DB table (mapped)

@@ -7,6 +7,7 @@
 #   - Swaps AWS CloudWatch logging for local console logging (json-file)
 #   - Points SQS_QUEUE_URL to the LocalStack container
 #   - Disables HMAC signature validation (so you can send curls with fake signatures)
+#   - Adds dummy AWS credentials (LocalStack doesn't verify them but boto3 needs them)
 
 services:
   webhook-receiver:
@@ -15,6 +16,9 @@ services:
     environment:
       - SQS_QUEUE_URL=http://localstack:4566/000000000000/hubspot-webhook-events
       - SKIP_SIGNATURE_VALIDATION=true
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_DEFAULT_REGION=us-west-2
     depends_on:
       - localstack
 
@@ -23,5 +27,8 @@ services:
       driver: json-file
     environment:
       - SQS_QUEUE_URL=http://localstack:4566/000000000000/hubspot-webhook-events
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_DEFAULT_REGION=us-west-2
     depends_on:
       - localstack

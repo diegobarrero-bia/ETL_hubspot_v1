@@ -14,8 +14,13 @@ class SQSClient:
 
     def __init__(self, queue_url: str, region: str = "us-west-2"):
         self.queue_url = queue_url
-        # Use LocalStack if queue URL contains localhost
-        endpoint_url = "http://localhost:4566" if "localhost" in queue_url else None
+        # Use LocalStack if queue URL points to localhost or localstack container
+        if "localhost" in queue_url:
+            endpoint_url = "http://localhost:4566"
+        elif "localstack" in queue_url:
+            endpoint_url = "http://localstack:4566"
+        else:
+            endpoint_url = None
         self.client = boto3.client("sqs", region_name=region, endpoint_url=endpoint_url)
 
     def check_health(self) -> bool:
