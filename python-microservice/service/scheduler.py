@@ -4,6 +4,8 @@ Internal scheduler for periodic ETL execution.
 Uses APScheduler to trigger ETL jobs on a configurable cron schedule.
 Disabled by default; enable via SCHEDULER_ENABLED=true environment variable.
 """
+from __future__ import annotations
+
 import logging
 import os
 

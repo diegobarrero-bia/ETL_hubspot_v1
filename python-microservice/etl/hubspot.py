@@ -1,4 +1,6 @@
 """Extracción de datos desde la API de HubSpot."""
+from __future__ import annotations
+
 import json
 import logging
 import time

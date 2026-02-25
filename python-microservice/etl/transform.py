@@ -1,4 +1,6 @@
 """Transformaciones de datos para el ETL HubSpot → PostgreSQL."""
+from __future__ import annotations
+
 import json
 import logging
 import re

@@ -5,6 +5,8 @@ Only ONE ETL execution is allowed at a time (enforced by a threading.Lock).
 Jobs are tracked in memory. For production persistence, replace _jobs dict
 with Redis or a database table.
 """
+from __future__ import annotations
+
 import logging
 import threading
 import uuid

@@ -1,4 +1,6 @@
 """Operaciones de base de datos PostgreSQL para el ETL."""
+from __future__ import annotations
+
 import logging
 
 import pandas as pd
