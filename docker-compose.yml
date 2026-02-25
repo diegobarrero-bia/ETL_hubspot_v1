@@ -1,0 +1,101 @@
+# docker-compose.yml — HubSpot Webhook Receiver + Event Processor
+#
+# Local development (webhook pipeline + LocalStack SQS):
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml --profile localstack up -d
+#
+# Production (with AWS SQS + CloudWatch):
+#   docker compose up -d
+#
+# Include existing ETL microservice (optional, for nightly reconciliation):
+#   docker compose --profile etl up -d
+
+services:
+  # ─── Existing ETL Microservice (optional) ───
+  existing-etl:
+    profiles:
+      - etl
+    build:
+      context: ./python-microservice
+      dockerfile: Dockerfile
+    container_name: etl-hubspot-postgres
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./python-microservice/.env
+    environment:
+      - SCHEDULER_ENABLED=true
+      - SCHEDULER_CRON=0 2 * * *
+      - SCHEDULER_OBJECT_TYPES=contacts,deals,companies,tickets,services
+      - SCHEDULER_FORCE_FULL_LOAD=false
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: us-west-2
+        awslogs-group: /hubspot-webhook/etl
+        awslogs-create-group: "true"
+
+  # ─── Webhook Receiver ───
+  webhook-receiver:
+    build:
+      context: ./python-webhook-receiver
+      dockerfile: Dockerfile
+    container_name: webhook-receiver
+    ports:
+      - "8080:8080"
+    env_file:
+      - ./python-webhook-receiver/.env.webhook
+    volumes:
+      - ./python-microservice/etl:/app/etl:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: us-west-2
+        awslogs-group: /hubspot-webhook/receiver
+        awslogs-create-group: "true"
+
+  # ─── Event Processor Worker ───
+  event-processor:
+    build:
+      context: ./python-webhook-receiver
+      dockerfile: Dockerfile.processor
+    container_name: event-processor
+    env_file:
+      - ./python-webhook-receiver/.env.webhook
+    volumes:
+      - ./python-microservice/etl:/app/etl:ro
+    restart: unless-stopped
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: us-west-2
+        awslogs-group: /hubspot-webhook/processor
+        awslogs-create-group: "true"
+    depends_on:
+      webhook-receiver:
+        condition: service_healthy
+
+  # ─── LocalStack (local development only) ───
+  localstack:
+    image: localstack/localstack:3
+    container_name: localstack
+    profiles:
+      - localstack
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=sqs
+      - DEFAULT_REGION=us-west-2
+    volumes:
+      - ./scripts/localstack-init.sh:/etc/localstack/init/ready.d/init-sqs.sh:ro

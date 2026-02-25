@@ -1,0 +1,32 @@
+# HubSpot Webhook Subscription Configuration
+# Used by scripts/register_webhooks.py to create/update subscriptions.
+#
+# Usage: python scripts/register_webhooks.py --config webhook_subscriptions.yaml
+
+app_id: "YOUR_HUBSPOT_APP_ID"
+webhook_url: "https://your-ec2-public-ip:8080/webhooks/hubspot"
+
+subscriptions:
+  - objectType: contacts
+    eventTypes: [contact.creation, contact.deletion, contact.propertyChange]
+
+  - objectType: deals
+    eventTypes: [deal.creation, deal.deletion, deal.propertyChange]
+
+  - objectType: companies
+    eventTypes: [company.creation, company.deletion, company.propertyChange]
+
+  - objectType: tickets
+    eventTypes: [ticket.creation, ticket.deletion, ticket.propertyChange]
+
+  # Custom object (Extended Webhooks Beta)
+  - objectType: services
+    eventTypes: [services.creation, services.deletion, services.propertyChange]
+
+  # Line items
+  - objectType: line_items
+    eventTypes: [line_item.creation, line_item.deletion, line_item.propertyChange]
+
+  # Quotes
+  - objectType: quotes
+    eventTypes: [quote.creation, quote.deletion, quote.propertyChange]

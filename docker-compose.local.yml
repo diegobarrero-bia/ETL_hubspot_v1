@@ -1,0 +1,27 @@
+# docker-compose.local.yml — Local development overrides
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml --profile localstack up -d
+#
+# What this changes:
+#   - Swaps AWS CloudWatch logging for local console logging (json-file)
+#   - Points SQS_QUEUE_URL to the LocalStack container
+#   - Disables HMAC signature validation (so you can send curls with fake signatures)
+
+services:
+  webhook-receiver:
+    logging:
+      driver: json-file
+    environment:
+      - SQS_QUEUE_URL=http://localstack:4566/000000000000/hubspot-webhook-events
+      - SKIP_SIGNATURE_VALIDATION=true
+    depends_on:
+      - localstack
+
+  event-processor:
+    logging:
+      driver: json-file
+    environment:
+      - SQS_QUEUE_URL=http://localstack:4566/000000000000/hubspot-webhook-events
+    depends_on:
+      - localstack
